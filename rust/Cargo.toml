@@ -24,4 +24,3 @@ tracing = "0.1"
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
 wiremock = "0.6"
-hex = "0.4"

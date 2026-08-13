@@ -6,10 +6,14 @@
 //! endpoint, stubbed per case exactly as `cases.json` specifies.
 //!
 //! The Ed25519 keys the cases are signed with live in
-//! `../contract/fixtures/` (`signing-key.json`, `wrong-key.json`) — test-only
-//! keys generated for this contract, never used to sign anything real. Both
-//! this suite and the JS package's suite sign against the same fixture, so
-//! a signature bug shows up identically in either implementation.
+//! `../contract/fixtures/` (`jwks.json`, `signing-key.private.jwk.json`,
+//! `wrong-key.private.jwk.json`) — test-only keys generated for this
+//! contract, never used to sign anything real. Both this suite and the JS
+//! package's suite sign against the same fixture, so a signature bug shows
+//! up identically in either implementation. `jwks.json` is served to the
+//! guard verbatim rather than re-derived, so a checked-in mismatch between
+//! the private and public halves would fail this suite rather than go
+//! unnoticed.
 //!
 //! `sequence` cases (the three breaker cases) drive the guard's
 //! [`AdminIntrospectClient`] with a [`FakeClock`] behind its circuit
@@ -22,7 +26,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
-use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
+use ed25519_dalek::{Signer, SigningKey};
 use maxion_admin_guard::{
     AdminGuard, AdminIntrospectClient, AdminJwksClient, AdminJwksClientConfig, AdminTokenVerifier,
     FakeClock, GuardConfig, Requirement,
@@ -32,8 +36,9 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const CASES_PATH: &str = "../contract/cases.json";
-const SIGNING_KEY_FIXTURE: &str = "../contract/fixtures/signing-key.json";
-const WRONG_KEY_FIXTURE: &str = "../contract/fixtures/wrong-key.json";
+const JWKS_FIXTURE: &str = "../contract/fixtures/jwks.json";
+const SIGNING_KEY_FIXTURE: &str = "../contract/fixtures/signing-key.private.jwk.json";
+const WRONG_KEY_FIXTURE: &str = "../contract/fixtures/wrong-key.private.jwk.json";
 
 /// Kept short so the 12-odd simulated-timeout calls in the breaker sequences
 /// do not turn this suite into a slow one. The mock server's delay for a
@@ -50,10 +55,14 @@ fn load_json(path: &str) -> Value {
     serde_json::from_str(&text).unwrap_or_else(|e| panic!("cannot parse {}: {e}", full.display()))
 }
 
+/// Load an Ed25519 signing key from a private JWK (RFC 8037: `d` is the
+/// base64url, unpadded, 32-byte seed).
 fn load_seed(fixture_path: &str) -> SigningKey {
     let fixture = load_json(fixture_path);
-    let hex_seed = fixture["seedHex"].as_str().expect("seedHex field");
-    let bytes = hex::decode(hex_seed).expect("seedHex must be valid hex");
+    let d = fixture["d"].as_str().expect("JWK `d` field");
+    let bytes = URL_SAFE_NO_PAD
+        .decode(d)
+        .expect("JWK `d` must be valid base64url");
     let seed: [u8; 32] = bytes.as_slice().try_into().expect("seed must be 32 bytes");
     SigningKey::from_bytes(&seed)
 }
@@ -89,6 +98,7 @@ struct Fixture {
     good_key: SigningKey,
     wrong_key: SigningKey,
     kid: String,
+    jwks_body: Value,
     top_config: Value,
 }
 
@@ -99,22 +109,17 @@ impl Fixture {
             good_key: load_seed(SIGNING_KEY_FIXTURE),
             wrong_key: load_seed(WRONG_KEY_FIXTURE),
             kid: signing_fixture["kid"].as_str().unwrap().to_string(),
+            jwks_body: load_json(JWKS_FIXTURE),
             top_config: load_json(CASES_PATH)["config"].clone(),
         }
     }
 
+    /// The checked-in `jwks.json`, served verbatim rather than re-derived
+    /// from `good_key` — so a mismatch between the private and public
+    /// fixture halves fails this suite instead of hiding behind a
+    /// self-consistent re-derivation.
     fn jwks_body(&self) -> Value {
-        let pubkey: VerifyingKey = self.good_key.verifying_key();
-        json!({
-            "keys": [{
-                "kty": "OKP",
-                "crv": "Ed25519",
-                "kid": self.kid,
-                "alg": "EdDSA",
-                "use": "sig",
-                "x": URL_SAFE_NO_PAD.encode(pubkey.to_bytes()),
-            }]
-        })
+        self.jwks_body.clone()
     }
 
     /// Mint a JWT per a case's `token` spec. `null`/absent fields fall back

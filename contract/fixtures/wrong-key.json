@@ -1,5 +1,0 @@
-{
-  "_comment": "Test-only Ed25519 key generated for the admin-auth contract test suite (cases.json), used only to produce a token signed by a key OTHER than the one published in the JWKS (the 'bad-signature-401' case, token.signWith == 'wrong-key'). This key is never published in a JWKS document and never signs anything real.",
-  "seedHex": "ed80afc881ed2cf0046819ef94dcbb6a34cea5be71804d4550f4bbd5906e13b4",
-  "seedEncoding": "hex, 32 bytes, the Ed25519 private key seed (RFC 8032)."
-}
