@@ -202,21 +202,19 @@ impl Rig {
     async fn build(fixture: &Fixture, case: &Value) -> Self {
         let jwks_server = MockServer::start().await;
         let jwks_path = fixture.top_config["jwksPath"].as_str().unwrap();
-        Mock::given(method("GET"))
-            .and(path(jwks_path))
-            .respond_with(ResponseTemplate::new(200).set_body_json(fixture.jwks_body()))
-            .mount(&jwks_server)
-            .await;
+        mount_jwks(&jwks_server, jwks_path, fixture.jwks_body(), case.get("jwks")).await;
 
         let introspect_server = MockServer::start().await;
 
         let config = build_config(fixture, case, &jwks_server, &introspect_server);
 
         let http = reqwest::Client::new();
-        let jwks_provider = Arc::new(AdminJwksClient::new(
-            AdminJwksClientConfig::new(config.jwks_url.clone()),
-            http.clone(),
-        ));
+        let mut jwks_config = AdminJwksClientConfig::new(config.jwks_url.clone());
+        // Short enough that the "timeout" transport in a case's `jwks` spec
+        // actually times out against MOCK_TIMEOUT_DELAY, rather than just
+        // being a slow-but-successful fetch.
+        jwks_config.http_timeout = TEST_HTTP_TIMEOUT;
+        let jwks_provider = Arc::new(AdminJwksClient::new(jwks_config, http.clone()));
         let verifier = AdminTokenVerifier::new(jwks_provider, config.issuer.clone());
 
         let clock = Arc::new(FakeClock::new());
@@ -286,6 +284,43 @@ impl Rig {
     async fn jwks_call_count(&self) -> usize {
         self.jwks_server.received_requests().await.unwrap().len()
     }
+}
+
+/// Mount the JWKS endpoint per a case's optional `jwks` spec:
+/// `{coldCache: true, transport: "timeout"|"http"|"malformed", status?: n}`.
+/// Absent, or present with no `transport` (the kid-absent case, which needs
+/// a *successful* fetch that just lacks the requested kid), it serves the
+/// fixture key set verbatim as before. `coldCache` is asserted rather than
+/// acted on: every case already gets a brand-new [`AdminJwksClient`] in
+/// [`Rig::build`], so the cache is cold by construction and this harness has
+/// no way to pre-warm it.
+async fn mount_jwks(server: &MockServer, jwks_path: &str, fixture_body: Value, spec: Option<&Value>) {
+    if let Some(spec) = spec {
+        assert_eq!(
+            spec.get("coldCache").and_then(Value::as_bool),
+            Some(true),
+            "jwks harness only supports coldCache: true (every case's cache starts empty already)"
+        );
+    }
+
+    let template = match spec.and_then(|s| s.get("transport")).and_then(Value::as_str) {
+        None => ResponseTemplate::new(200).set_body_json(fixture_body),
+        Some("timeout") => ResponseTemplate::new(200).set_delay(MOCK_TIMEOUT_DELAY),
+        Some("http") => {
+            let status = spec.unwrap()["status"]
+                .as_u64()
+                .expect("status for http transport") as u16;
+            ResponseTemplate::new(status)
+        }
+        Some("malformed") => ResponseTemplate::new(200).set_body_string("not-json"),
+        Some(other) => panic!("unknown jwks transport '{other}'"),
+    };
+
+    Mock::given(method("GET"))
+        .and(path(jwks_path))
+        .respond_with(template)
+        .mount(server)
+        .await;
 }
 
 fn build_config(

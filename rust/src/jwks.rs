@@ -143,7 +143,7 @@ impl AdminJwksClient {
             .await
             .map_err(|e| {
                 tracing::warn!(error = %e, url = %self.config.jwks_url, "admin JWKS fetch failed");
-                GuardError::unauthorized("admin JWKS endpoint unreachable")
+                GuardError::unavailable("admin JWKS endpoint unreachable")
             })?;
 
         if !response.status().is_success() {
@@ -152,7 +152,7 @@ impl AdminJwksClient {
                 url = %self.config.jwks_url,
                 "admin JWKS fetch returned non-2xx"
             );
-            return Err(GuardError::unauthorized(format!(
+            return Err(GuardError::unavailable(format!(
                 "admin JWKS endpoint returned {}",
                 response.status()
             )));
@@ -161,7 +161,7 @@ impl AdminJwksClient {
         let ttl = max_age(response.headers()).unwrap_or(self.config.default_ttl);
         let body: JwksResponse = response.json().await.map_err(|e| {
             tracing::warn!(error = %e, "admin JWKS response parse failed");
-            GuardError::unauthorized("admin JWKS response was malformed")
+            GuardError::unavailable("admin JWKS response was malformed")
         })?;
 
         let mut keys = HashMap::new();
@@ -263,6 +263,67 @@ fn decode_ed25519_key(x_b64: &str) -> GuardResult<VerifyingKey> {
 mod tests {
     use super::*;
     use reqwest::header::{HeaderMap, HeaderValue, CACHE_CONTROL};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// A client with a short HTTP timeout, so a delayed mock response
+    /// actually times out instead of just being slow. Mirrors
+    /// `introspect_client`'s `TEST_HTTP_TIMEOUT` pattern.
+    fn short_timeout_client(jwks_url: String) -> AdminJwksClient {
+        let mut config = AdminJwksClientConfig::new(jwks_url);
+        config.http_timeout = Duration::from_millis(100);
+        AdminJwksClient::new(config, reqwest::Client::new())
+    }
+
+    /// Contract rule 5: a cold cache plus an unreachable JWKS endpoint is a
+    /// dependency outage (`Unavailable`/503), not a bad credential.
+    #[tokio::test]
+    async fn a_transport_failure_on_cold_cache_is_unavailable_not_unauthorized() {
+        let client = short_timeout_client("http://127.0.0.1:1/jwks.json".to_string());
+        let err = client.resolve_key("any-kid").await.unwrap_err();
+        assert!(
+            matches!(err, GuardError::Unavailable(_)),
+            "expected Unavailable, got {err:?}"
+        );
+    }
+
+    /// Contract rule 5: a JWKS endpoint answering non-2xx is unreachable for
+    /// our purposes; the token is not implicated.
+    #[tokio::test]
+    async fn a_non_2xx_jwks_response_is_unavailable_not_unauthorized() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/jwks.json"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let client = short_timeout_client(format!("{}/jwks.json", server.uri()));
+        let err = client.resolve_key("any-kid").await.unwrap_err();
+        assert!(
+            matches!(err, GuardError::Unavailable(_)),
+            "expected Unavailable, got {err:?}"
+        );
+    }
+
+    /// Contract rule 5: an unparseable key set is a broken dependency, not a
+    /// bad credential.
+    #[tokio::test]
+    async fn a_malformed_jwks_body_is_unavailable_not_unauthorized() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/jwks.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("not-json"))
+            .mount(&server)
+            .await;
+
+        let client = short_timeout_client(format!("{}/jwks.json", server.uri()));
+        let err = client.resolve_key("any-kid").await.unwrap_err();
+        assert!(
+            matches!(err, GuardError::Unavailable(_)),
+            "expected Unavailable, got {err:?}"
+        );
+    }
 
     fn headers(value: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();
