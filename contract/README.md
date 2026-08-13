@@ -58,6 +58,22 @@ A value that is neither array nor object contributes no entry at all. Output is
 deduplicated and sorted, so two tokens carrying the same grants in a different
 order authorize identically.
 
+## Known gap: a JWKS with duplicate `kid`s
+
+Not covered by a case yet, and the two implementations disagree — recorded here
+so it is not rediscovered from scratch.
+
+If the IdP ever publishes two keys sharing a `kid`, Rust's key map does
+`insert(kid, key)` in document order, so the last one silently wins and which
+key verifies a token depends on document ordering. JS raises jose's
+`JWKSMultipleMatchingKeys` and currently answers 401.
+
+Neither is obviously right, but 401 is the least defensible of the three
+options: the token is not implicated, the key set is. By the same reasoning as
+rule 5 this is a "cannot tell" and should be 503 in both. Closing it means a
+case here, duplicate detection in Rust, and a reclassification in JS — worth
+doing, not urgent, since it takes an IdP misconfiguration to reach.
+
 ## Running the suite
 
 Each library reads `cases.json`, feeds every case through its own verifier with
