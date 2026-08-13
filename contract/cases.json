@@ -234,6 +234,38 @@
     },
 
     {
+      "id": "jwks-unreachable-cold-cache-503",
+      "why": "With no keys cached yet and the JWKS endpoint unreachable, the verifier cannot form an opinion about this token at all. That is the same class of failure as an introspect timeout and must answer the same way. Answering 401 tells every admin their credential is bad during an IdP outage: they get logged out, they retry, they file tickets, and nobody is paged because 401 is a normal thing to see in a metrics dashboard. Both implementations got this wrong until this case existed.",
+      "method": "GET", "require": { "site": "mu-back-office", "feature": "news-management" },
+      "token": { "role": "super_admin", "type": "admin", "siteAccess": {}, "valid": true },
+      "jwks": { "coldCache": true, "transport": "timeout" },
+      "expect": { "status": 503 }
+    },
+    {
+      "id": "jwks-non-2xx-cold-cache-503",
+      "why": "A JWKS endpoint answering 500 is unreachable for our purposes; the token is not implicated.",
+      "method": "GET", "require": { "site": "mu-back-office", "feature": "news-management" },
+      "token": { "role": "super_admin", "type": "admin", "siteAccess": {}, "valid": true },
+      "jwks": { "coldCache": true, "transport": "http", "status": 500 },
+      "expect": { "status": 503 }
+    },
+    {
+      "id": "jwks-malformed-cold-cache-503",
+      "why": "An unparseable key set is a broken dependency, not a bad credential. Kept separate from the two above because a JSON error is easy to catch in the wrong place and collapse into 'invalid token'.",
+      "method": "GET", "require": { "site": "mu-back-office", "feature": "news-management" },
+      "token": { "role": "super_admin", "type": "admin", "siteAccess": {}, "valid": true },
+      "jwks": { "coldCache": true, "transport": "malformed" },
+      "expect": { "status": 503 }
+    },
+    {
+      "id": "jwks-fetched-but-kid-absent-401",
+      "why": "The boundary of the three cases above. Here the fetch SUCCEEDED and simply does not contain the requested kid — we can form an opinion, and the opinion is that this token is not ours. Anything that answers 503 here has over-corrected and turned a bad token into a pager alert.",
+      "method": "GET", "require": { "site": "mu-back-office", "feature": "news-management" },
+      "token": { "role": "super_admin", "type": "admin", "siteAccess": {}, "valid": true, "kid": "ed-does-not-exist" },
+      "jwks": { "coldCache": true },
+      "expect": { "status": 401 }
+    },
+    {
       "id": "breaker-opens-after-5-transport-failures",
       "why": "The 6th write short-circuits without another call, so a down IdP is not hammered.",
       "sequence": [

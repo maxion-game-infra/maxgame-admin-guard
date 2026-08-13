@@ -30,7 +30,11 @@ the fourth implementation does not have to be written from scratch.
    `active:false` is 401; a failure to obtain a verdict at all (timeout,
    network, non-2xx, open breaker, malformed body) is 503. These must not
    collapse into one status: the first means "this session ended", the second
-   means "we cannot tell", and only the second should page anyone.
+   means "we cannot tell", and only the second should page anyone. This covers
+   the key set as well as introspection: a JWKS endpoint that is unreachable,
+   answers non-2xx, or returns something unparseable is a dependency outage
+   (503), while a key set that arrives fine and simply lacks the token's `kid`
+   is a bad credential (401).
 6. **Empty access** — a non-super-admin whose `siteAccess` has no entries gets
    403 before any feature check. A site key present with an empty array counts
    as having the site, and then fails the feature check.
