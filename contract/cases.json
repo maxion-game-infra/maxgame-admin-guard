@@ -267,7 +267,7 @@
 
     {
       "id": "unconfigured-refuses-not-allows",
-      "why": "A verifier missing its IdP base URL or introspect key must refuse every request. This is the fail-open bug that already exists elsewhere in the platform and must not be reproduced.",
+      "why": "A verifier missing its IdP base URL or introspect key must refuse every request. This is the fail-open bug that already exists elsewhere in the platform and must not be reproduced. Both 500 and 503 are accepted deliberately: the implementations differ on where they notice (Rust validates at request time and answers 503, the JS package throws at construction and surfaces as 500) and neither is wrong. What is load-bearing is that it refuses — pinning one status would force a change with no operational benefit, since a service in this state is broken either way and both answers say so.",
       "method": "GET", "require": { "site": "mu-back-office", "feature": "news-management" },
       "token": { "role": "super_admin", "type": "admin", "siteAccess": {}, "valid": true },
       "config": { "idpBaseUrl": "", "introspectApiKey": "" },
