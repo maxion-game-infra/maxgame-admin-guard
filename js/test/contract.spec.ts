@@ -6,6 +6,8 @@
  * clock for the breaker's `sequence` cases. See contract/README.md.
  */
 import { readFileSync } from 'node:fs';
+import * as http from 'node:http';
+import type { AddressInfo } from 'node:net';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -127,6 +129,101 @@ function specToTransportResult(spec: IntrospectSpec): { status: number; body: un
   return { status: 200, body: spec };
 }
 
+/**
+ * What a case can stub the JWKS endpoint to. `coldCache: true` is required
+ * on every one of these — the point is to exercise a genuine fetch, not a
+ * warm/cached resolver — and is asserted below.
+ */
+type JwksSpec = {
+  coldCache: true;
+  transport?: 'timeout' | 'http' | 'malformed';
+  status?: number;
+};
+
+/**
+ * Cases with a `jwks` field get a *real* `jose.createRemoteJWKSet` pointed
+ * at a real (ephemeral, localhost-only) HTTP server, rather than a
+ * hand-rolled resolver that throws a made-up error. jose's own fetch path
+ * throws specific, version-pinned error types depending on exactly how the
+ * fetch failed (`JWKSTimeout` for a timeout, its bare `JOSEError` base
+ * class for a non-2xx or unparseable body) — faking those by hand risks
+ * testing a shape the fix's classifier was never actually written against.
+ * A fresh server + a fresh `createRemoteJWKSet` per case also guarantees
+ * "cold cache": there is no cache to be warm.
+ */
+async function startJwksServer(spec: JwksSpec): Promise<{ url: URL; close: () => Promise<void> }> {
+  const server = http.createServer((req, res) => {
+    req.on('error', () => {
+      // The client destroys the socket once its own timeout fires; that
+      // must not surface as an unhandled error on the server side.
+    });
+    if (spec.transport === 'timeout') {
+      // Never respond. The client's own timeoutDuration cuts this short.
+      return;
+    }
+    if (spec.transport === 'http') {
+      res.writeHead(spec.status ?? 500, { 'content-type': 'application/json' });
+      res.end('{}');
+      return;
+    }
+    if (spec.transport === 'malformed') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end('not valid json{{{');
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify(jwksDoc));
+  });
+  server.on('clientError', () => {
+    // Belt-and-suspenders: a socket the client tore down mid-request must
+    // not throw an unhandled error and fail the test.
+  });
+
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address() as AddressInfo;
+  return {
+    url: new URL('/jwks.json', `http://127.0.0.1:${address.port}`),
+    close: () => new Promise<void>((resolve) => server.close(() => resolve())),
+  };
+}
+
+/**
+ * Builds the jwks resolver for one case: the real remote fetch (via
+ * {@link startJwksServer}) when the case carries a `jwks` field, otherwise
+ * the existing zero-network local resolver every other case already uses.
+ * Returns a teardown to close the server, a no-op for the local-resolver
+ * path.
+ */
+async function buildJwksResolverForCase(
+  kaseJwks: JwksSpec | undefined,
+  jwksSpy: ReturnType<typeof vi.fn>,
+): Promise<{ resolver: JwksResolver; teardown: () => Promise<void> }> {
+  if (!kaseJwks) {
+    type LocalJwksFn = ReturnType<typeof jose.createLocalJWKSet>;
+    const baseResolver: LocalJwksFn = jose.createLocalJWKSet(jwksDoc);
+    const resolver = (async (...args: Parameters<LocalJwksFn>) => {
+      jwksSpy();
+      return baseResolver(...args);
+    }) as JwksResolver;
+    return { resolver, teardown: async () => {} };
+  }
+
+  if (!kaseJwks.coldCache) {
+    throw new Error('contract test bug: every jwks case must set coldCache: true');
+  }
+
+  const { url, close } = await startJwksServer(kaseJwks);
+  // Short timeoutDuration so the `timeout` case resolves in well under a
+  // second instead of jose's 5s default; harmless for the other transports
+  // since the local server answers immediately.
+  const remote = jose.createRemoteJWKSet(url, { timeoutDuration: 300 });
+  const resolver = (async (...args: Parameters<typeof remote>) => {
+    jwksSpy();
+    return remote(...args);
+  }) as JwksResolver;
+  return { resolver, teardown: close };
+}
+
 type HarnessOutcome = {
   status: number;
   reason?: string;
@@ -212,12 +309,10 @@ describe('admin-auth contract', () => {
       const clock = { now: 0 };
 
       const jwksSpy = vi.fn();
-      type LocalJwksFn = ReturnType<typeof jose.createLocalJWKSet>;
-      const baseResolver: LocalJwksFn = jose.createLocalJWKSet(jwksDoc);
-      const spiedJwks = (async (...args: Parameters<LocalJwksFn>) => {
-        jwksSpy();
-        return baseResolver(...args);
-      }) as JwksResolver;
+      const { resolver: spiedJwks, teardown: teardownJwks } = await buildJwksResolverForCase(
+        kase.jwks as JwksSpec | undefined,
+        jwksSpy,
+      );
 
       let currentIntrospectSpec: IntrospectSpec = kase.introspect ?? null;
       const transportSpy = vi.fn();
@@ -226,75 +321,79 @@ describe('admin-auth contract', () => {
         return specToTransportResult(currentIntrospectSpec);
       };
 
-      let jwtVerifier: AdminJwtVerifier;
-      let introspectClient: AdminIntrospectClient;
       try {
-        jwtVerifier = new AdminJwtVerifier({ issuer: config.issuer, jwks: spiedJwks });
-        introspectClient = new AdminIntrospectClient({
-          idpBaseUrl: config.idpBaseUrl ?? 'http://idp.invalid',
-          introspectApiKey: config.introspectApiKey ?? 'test-key',
-          introspectPath: config.introspectPath,
-          introspectHeader: config.introspectHeader,
-          breaker: {
-            failureThreshold: config.breaker.failureThreshold,
-            resetTimeoutMs: config.breaker.openMs,
-          },
-          clock: () => clock.now,
-          transport,
-        });
-      } catch (err) {
-        // Rule 8 exercised at construction time (contract case
-        // `unconfigured-refuses-not-allows`): a verifier that cannot reach
-        // its own configuration must refuse, never silently allow.
-        assertOutcome(kase.sequence ? kase.sequence[0].expect : kase.expect, {
-          status: 500,
-          reason: err instanceof Error ? err.message : String(err),
-          introspectCalled: false,
-          jwksFetched: false,
-        });
-        return;
-      }
-
-      const require: RequireScope = kase.require ?? null;
-      const rawToken = await tokenForCase(kase);
-      const mutatingMethods = config.mutatingMethods;
-
-      if (kase.sequence) {
-        for (const step of kase.sequence as Array<Record<string, any>>) {
-          if (step.advanceMs !== undefined) {
-            clock.now += step.advanceMs;
-            continue;
-          }
-          currentIntrospectSpec = step.introspect ?? null;
-          const repeat = step.repeat ?? 1;
-          for (let i = 0; i < repeat; i++) {
-            const outcome = await runRequest(
-              step.method,
-              rawToken,
-              require,
-              jwtVerifier,
-              introspectClient,
-              transportSpy,
-              jwksSpy,
-              mutatingMethods,
-            );
-            assertOutcome(step.expect, outcome);
-          }
+        let jwtVerifier: AdminJwtVerifier;
+        let introspectClient: AdminIntrospectClient;
+        try {
+          jwtVerifier = new AdminJwtVerifier({ issuer: config.issuer, jwks: spiedJwks });
+          introspectClient = new AdminIntrospectClient({
+            idpBaseUrl: config.idpBaseUrl ?? 'http://idp.invalid',
+            introspectApiKey: config.introspectApiKey ?? 'test-key',
+            introspectPath: config.introspectPath,
+            introspectHeader: config.introspectHeader,
+            breaker: {
+              failureThreshold: config.breaker.failureThreshold,
+              resetTimeoutMs: config.breaker.openMs,
+            },
+            clock: () => clock.now,
+            transport,
+          });
+        } catch (err) {
+          // Rule 8 exercised at construction time (contract case
+          // `unconfigured-refuses-not-allows`): a verifier that cannot reach
+          // its own configuration must refuse, never silently allow.
+          assertOutcome(kase.sequence ? kase.sequence[0].expect : kase.expect, {
+            status: 500,
+            reason: err instanceof Error ? err.message : String(err),
+            introspectCalled: false,
+            jwksFetched: false,
+          });
+          return;
         }
-        return;
-      }
 
-      const outcome = await runRequest(
-        kase.method,
-        rawToken,
-        require,
-        jwtVerifier,
-        introspectClient,
-        transportSpy,
-        jwksSpy,
-        mutatingMethods,
-      );
-      assertOutcome(kase.expect, outcome);
+        const require: RequireScope = kase.require ?? null;
+        const rawToken = await tokenForCase(kase);
+        const mutatingMethods = config.mutatingMethods;
+
+        if (kase.sequence) {
+          for (const step of kase.sequence as Array<Record<string, any>>) {
+            if (step.advanceMs !== undefined) {
+              clock.now += step.advanceMs;
+              continue;
+            }
+            currentIntrospectSpec = step.introspect ?? null;
+            const repeat = step.repeat ?? 1;
+            for (let i = 0; i < repeat; i++) {
+              const outcome = await runRequest(
+                step.method,
+                rawToken,
+                require,
+                jwtVerifier,
+                introspectClient,
+                transportSpy,
+                jwksSpy,
+                mutatingMethods,
+              );
+              assertOutcome(step.expect, outcome);
+            }
+          }
+          return;
+        }
+
+        const outcome = await runRequest(
+          kase.method,
+          rawToken,
+          require,
+          jwtVerifier,
+          introspectClient,
+          transportSpy,
+          jwksSpy,
+          mutatingMethods,
+        );
+        assertOutcome(kase.expect, outcome);
+      } finally {
+        await teardownJwks();
+      }
     });
   }
 });

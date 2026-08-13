@@ -93,10 +93,52 @@ export class AdminJwtVerifier {
       });
       return payload as AdminTokenClaims;
     } catch (err) {
-      if ((err as { code?: string })?.code === 'ERR_JWT_EXPIRED') {
-        throw new AdminGuardError(401, 'Token expired');
-      }
-      throw new AdminGuardError(401, 'Invalid token');
+      throw classifyVerifyError(err);
     }
   }
+}
+
+/**
+ * Rule 5: a key set that cannot be *obtained* — the JWKS endpoint is
+ * unreachable, answers non-2xx, or returns something unparseable — is a
+ * dependency outage (503); the token is not implicated. A key set that
+ * *arrives* and simply lacks the token's `kid`, or any other failure once
+ * jose has a key set in hand (bad signature, wrong issuer, expired, wrong
+ * alg), is a bad credential (401).
+ *
+ * This is decided by inspecting jose's error *types*, not message strings
+ * (which change between versions and are not part of jose's contract).
+ * Every failure jose raises while checking a token it already has a key
+ * for is a named `jose.errors.JOSEError` subclass with its own `code`. The
+ * JWKS fetch path is the one exception: on a timeout it throws
+ * `JWKSTimeout`, and on a non-2xx response or an unparseable body it
+ * throws the bare `JOSEError` base class itself (code `ERR_JOSE_GENERIC`)
+ * — nothing else in jose throws that base class directly, every other site
+ * throws a subclass. A genuine transport/connection failure (DNS,
+ * ECONNREFUSED, socket reset) never reaches jose's parsing code at all, so
+ * it surfaces as a plain `Error` that is not a `JOSEError` instance.
+ */
+function classifyVerifyError(err: unknown): AdminGuardError {
+  if (err instanceof jose.errors.JWTExpired) {
+    return new AdminGuardError(401, 'Token expired');
+  }
+  if (err instanceof jose.errors.JWKSNoMatchingKey) {
+    // The key set arrived; it just doesn't contain this token's kid.
+    return new AdminGuardError(401, 'Invalid token');
+  }
+  if (err instanceof jose.errors.JWKSTimeout) {
+    return new AdminGuardError(503, 'Admin IdP key set is unavailable');
+  }
+  if (err instanceof jose.errors.JOSEError && err.constructor === jose.errors.JOSEError) {
+    // The one case where jose throws its base class directly, rather than
+    // a named subclass: fetch_jwks.js on a non-2xx response or malformed
+    // JSON body.
+    return new AdminGuardError(503, 'Admin IdP key set is unavailable');
+  }
+  if (!(err instanceof jose.errors.JOSEError)) {
+    // Didn't reach jose's own error types at all: a transport-level
+    // failure while fetching the JWKS (connection refused/reset, DNS).
+    return new AdminGuardError(503, 'Admin IdP key set is unavailable');
+  }
+  return new AdminGuardError(401, 'Invalid token');
 }
