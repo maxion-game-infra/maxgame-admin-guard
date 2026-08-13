@@ -1,0 +1,291 @@
+{
+  "$comment": "Behavioural cases every admin-auth verifier must satisfy. See README.md. Both the Rust crate and the npm package run this file as their test suite.",
+  "config": {
+    "issuer": "admin-auth.maxion.game",
+    "jwksPath": "/.well-known/jwks.json",
+    "introspectPath": "/api/v1/oauth/introspect",
+    "introspectHeader": "x-api-key",
+    "breaker": { "failureThreshold": 5, "openMs": 30000 },
+    "mutatingMethods": ["POST", "PUT", "PATCH", "DELETE"]
+  },
+
+  "$claimNotes": {
+    "token": "Claims are camelCase, as minted: sub, role, type, sid, siteAccess, tokenVersion, iss, exp.",
+    "introspect": "Response is snake_case-free but uses adminId, not sub: {active,adminId,username,role,siteAccess,tokenVersion} or {active:false,reason}.",
+    "me": "GET /api/v1/me is snake_case (site_access). Not this library's concern; noted so nobody 'fixes' the asymmetry."
+  },
+
+  "cases": [
+    {
+      "id": "read-super-admin-ok",
+      "why": "The everyday path: a super admin reading. No introspection call may be made.",
+      "method": "GET", "require": { "site": "maxion-game-back-office", "feature": "launcher-games" },
+      "token": { "role": "super_admin", "type": "admin", "siteAccess": {}, "valid": true },
+      "expect": { "status": 200, "introspectCalled": false, "adminIdSet": true }
+    },
+    {
+      "id": "read-granted-feature-ok",
+      "why": "Ordinary admin holding exactly the required feature.",
+      "method": "GET", "require": { "site": "zone4-back-office", "feature": "presale-stock" },
+      "token": { "role": "admin", "type": "admin", "siteAccess": { "zone4-back-office": ["presale-stock"] }, "valid": true },
+      "expect": { "status": 200, "introspectCalled": false }
+    },
+    {
+      "id": "read-wrong-feature-same-site-403",
+      "why": "Holding one feature on a site must not imply another on that site.",
+      "method": "GET", "require": { "site": "zone4-back-office", "feature": "presale-export" },
+      "token": { "role": "admin", "type": "admin", "siteAccess": { "zone4-back-office": ["presale-stock"] }, "valid": true },
+      "expect": { "status": 403 }
+    },
+    {
+      "id": "read-other-site-403",
+      "why": "A grant on one site must not carry to another.",
+      "method": "GET", "require": { "site": "mu-back-office", "feature": "news-management" },
+      "token": { "role": "admin", "type": "admin", "siteAccess": { "zone4-back-office": ["news-management"] }, "valid": true },
+      "expect": { "status": 403 }
+    },
+    {
+      "id": "legacy-object-shape-ok",
+      "why": "Old tokens carry {feature: 'edit'|'readonly'}; the keys are the grants.",
+      "method": "GET", "require": { "site": "zone4-back-office", "feature": "news-management" },
+      "token": { "role": "admin", "type": "admin", "siteAccess": { "zone4-back-office": { "news-management": "edit" } }, "valid": true },
+      "expect": { "status": 200 }
+    },
+    {
+      "id": "site-key-empty-array-403-on-feature",
+      "why": "An empty array still counts as having the site, so this must fail at the feature check, not the no-access check. The distinction matters: the messages differ.",
+      "method": "GET", "require": { "site": "zone4-back-office", "feature": "presale-stock" },
+      "token": { "role": "admin", "type": "admin", "siteAccess": { "zone4-back-office": [] }, "valid": true },
+      "expect": { "status": 403, "reasonContains": "feature" }
+    },
+    {
+      "id": "no-access-at-all-403",
+      "why": "A freshly provisioned admin with zero grants reaches nothing, and is refused before any feature check runs.",
+      "method": "GET", "require": { "site": "zone4-back-office", "feature": "presale-stock" },
+      "token": { "role": "admin", "type": "admin", "siteAccess": {}, "valid": true },
+      "expect": { "status": 403, "reasonContains": "No access assigned" }
+    },
+    {
+      "id": "siteaccess-garbage-value-ignored",
+      "why": "A value that is neither array nor object contributes nothing — it must not throw and must not grant.",
+      "method": "GET", "require": { "site": "zone4-back-office", "feature": "presale-stock" },
+      "token": { "role": "admin", "type": "admin", "siteAccess": { "zone4-back-office": 42 }, "valid": true },
+      "expect": { "status": 403 }
+    },
+    {
+      "id": "grants-order-independent",
+      "why": "Normalisation sorts and dedupes, so ordering and repeats cannot change the decision.",
+      "method": "GET", "require": { "site": "mu-back-office", "feature": "preregister-stats" },
+      "token": { "role": "admin", "type": "admin", "siteAccess": { "mu-back-office": ["preregister-stats", "news-management", "preregister-stats"] }, "valid": true },
+      "expect": { "status": 200 }
+    },
+
+    {
+      "id": "no-authorization-header-401",
+      "why": "Absent credential is 401, never a pass.",
+      "method": "GET", "require": { "site": "mu-back-office", "feature": "news-management" },
+      "token": null,
+      "expect": { "status": 401 }
+    },
+    {
+      "id": "malformed-token-401",
+      "why": "Three dot-separated garbage segments must be rejected without reaching JWKS.",
+      "method": "GET", "require": { "site": "mu-back-office", "feature": "news-management" },
+      "rawToken": "junk.junk.junk",
+      "expect": { "status": 401, "jwksFetched": false }
+    },
+    {
+      "id": "bad-signature-401",
+      "why": "Structurally valid, signed by the wrong key. Must reach signature verification and fail there — a 503 here would mean the JWKS path is broken instead.",
+      "method": "GET", "require": { "site": "mu-back-office", "feature": "news-management" },
+      "token": { "role": "super_admin", "type": "admin", "siteAccess": {}, "valid": true, "signWith": "wrong-key" },
+      "expect": { "status": 401 }
+    },
+    {
+      "id": "missing-kid-401",
+      "why": "A header without kid cannot be pinned to a published key.",
+      "method": "GET", "require": { "site": "mu-back-office", "feature": "news-management" },
+      "token": { "role": "super_admin", "type": "admin", "siteAccess": {}, "valid": true, "omitKid": true },
+      "expect": { "status": 401 }
+    },
+    {
+      "id": "unknown-kid-401",
+      "why": "A kid absent from the JWKS document is rejected, not treated as the active key.",
+      "method": "GET", "require": { "site": "mu-back-office", "feature": "news-management" },
+      "token": { "role": "super_admin", "type": "admin", "siteAccess": {}, "valid": true, "kid": "ed-does-not-exist" },
+      "expect": { "status": 401 }
+    },
+    {
+      "id": "wrong-issuer-401",
+      "why": "iss is compared byte-for-byte; a near-miss must fail.",
+      "method": "GET", "require": { "site": "mu-back-office", "feature": "news-management" },
+      "token": { "role": "super_admin", "type": "admin", "siteAccess": {}, "valid": true, "iss": "maxion-platform.maxion.game" },
+      "expect": { "status": 401 }
+    },
+    {
+      "id": "expired-401",
+      "why": "exp in the past.",
+      "method": "GET", "require": { "site": "mu-back-office", "feature": "news-management" },
+      "token": { "role": "super_admin", "type": "admin", "siteAccess": {}, "expired": true },
+      "expect": { "status": 401 }
+    },
+    {
+      "id": "wrong-type-401",
+      "why": "Only type=admin is an admin token. A refresh or any future token type from the same issuer must not authorize an admin route — this is the check key-server was missing.",
+      "method": "GET", "require": { "site": "mu-back-office", "feature": "news-management" },
+      "token": { "role": "super_admin", "type": "refresh", "siteAccess": {}, "valid": true },
+      "expect": { "status": 401 }
+    },
+    {
+      "id": "aud-present-still-accepted",
+      "why": "Verifiers must not reject a token merely for carrying aud, so the audience rollout can ship IdP-first without a flag day.",
+      "method": "GET", "require": { "site": "mu-back-office", "feature": "news-management" },
+      "token": { "role": "super_admin", "type": "admin", "siteAccess": {}, "valid": true, "aud": "maxgame-key-server" },
+      "expect": { "status": 200 }
+    },
+
+    {
+      "id": "write-introspect-active-ok",
+      "why": "A mutation introspects and proceeds on an active verdict.",
+      "method": "POST", "require": { "site": "maxion-game-back-office", "feature": "launcher-games" },
+      "token": { "role": "admin", "type": "admin", "siteAccess": { "maxion-game-back-office": ["launcher-games"] }, "valid": true },
+      "introspect": { "active": true, "adminId": "6c7b84de-9e3d-40ef-97eb-6bd47ae170a5", "role": "admin", "siteAccess": { "maxion-game-back-office": ["launcher-games"] }, "tokenVersion": 0 },
+      "expect": { "status": 200, "introspectCalled": true }
+    },
+    {
+      "id": "write-live-verdict-overrides-token-grant",
+      "why": "The load-bearing case for revocation: the token still claims the grant, the live verdict no longer does, and the live verdict wins.",
+      "method": "PATCH", "require": { "site": "maxion-game-back-office", "feature": "launcher-games" },
+      "token": { "role": "admin", "type": "admin", "siteAccess": { "maxion-game-back-office": ["launcher-games"] }, "valid": true },
+      "introspect": { "active": true, "adminId": "x", "role": "admin", "siteAccess": { "maxion-game-back-office": [] }, "tokenVersion": 0 },
+      "expect": { "status": 403 }
+    },
+    {
+      "id": "write-live-verdict-grants-beyond-token",
+      "why": "Symmetric case: a grant added after the token was minted takes effect on the next write, without a refresh.",
+      "method": "POST", "require": { "site": "zone4-back-office", "feature": "presale-stock" },
+      "token": { "role": "admin", "type": "admin", "siteAccess": { "zone4-back-office": [] }, "valid": true },
+      "introspect": { "active": true, "adminId": "x", "role": "admin", "siteAccess": { "zone4-back-office": ["presale-stock"] }, "tokenVersion": 0 },
+      "expect": { "status": 200 }
+    },
+    {
+      "id": "write-live-role-promotion-honoured",
+      "why": "A live super_admin verdict bypasses features even when the token says otherwise.",
+      "method": "DELETE", "require": { "site": "mu-back-office", "feature": "news-management" },
+      "token": { "role": "admin", "type": "admin", "siteAccess": {}, "valid": true },
+      "introspect": { "active": true, "adminId": "x", "role": "super_admin", "siteAccess": {}, "tokenVersion": 0 },
+      "expect": { "status": 200 }
+    },
+    {
+      "id": "write-inactive-401",
+      "why": "A definite 'this session ended' answer is 401 and must be distinguishable from being unable to ask.",
+      "method": "POST", "require": { "site": "mu-back-office", "feature": "news-management" },
+      "token": { "role": "super_admin", "type": "admin", "siteAccess": {}, "valid": true },
+      "introspect": { "active": false, "reason": "token_revoked" },
+      "expect": { "status": 401, "reasonContains": "token_revoked" }
+    },
+    {
+      "id": "write-introspect-timeout-503",
+      "why": "Unable to obtain a verdict is 503, not 401 and never a pass.",
+      "method": "POST", "require": { "site": "mu-back-office", "feature": "news-management" },
+      "token": { "role": "super_admin", "type": "admin", "siteAccess": {}, "valid": true },
+      "introspect": { "transport": "timeout" },
+      "expect": { "status": 503 }
+    },
+    {
+      "id": "write-introspect-500-503",
+      "why": "A non-2xx is a transport failure, not an inactive verdict.",
+      "method": "POST", "require": { "site": "mu-back-office", "feature": "news-management" },
+      "token": { "role": "super_admin", "type": "admin", "siteAccess": {}, "valid": true },
+      "introspect": { "transport": "http", "status": 500 },
+      "expect": { "status": 503 }
+    },
+    {
+      "id": "write-introspect-401-is-503-not-401",
+      "why": "Even a 401 FROM the IdP means our api key is wrong, not that the admin is revoked. Collapsing it into 401 would hide a misconfiguration behind a plausible-looking auth failure.",
+      "method": "POST", "require": { "site": "mu-back-office", "feature": "news-management" },
+      "token": { "role": "super_admin", "type": "admin", "siteAccess": {}, "valid": true },
+      "introspect": { "transport": "http", "status": 401 },
+      "expect": { "status": 503 }
+    },
+    {
+      "id": "write-introspect-malformed-503",
+      "why": "An unparseable body must not be read as active.",
+      "method": "POST", "require": { "site": "mu-back-office", "feature": "news-management" },
+      "token": { "role": "super_admin", "type": "admin", "siteAccess": {}, "valid": true },
+      "introspect": { "transport": "malformed" },
+      "expect": { "status": 503 }
+    },
+    {
+      "id": "write-active-without-adminid-401",
+      "why": "active:true with no adminId names nobody; refuse to authorize a write against an unidentifiable admin.",
+      "method": "POST", "require": { "site": "mu-back-office", "feature": "news-management" },
+      "token": { "role": "super_admin", "type": "admin", "siteAccess": {}, "valid": true },
+      "introspect": { "active": true, "adminId": "", "role": "super_admin", "siteAccess": {}, "tokenVersion": 0 },
+      "expect": { "status": 401 }
+    },
+    {
+      "id": "read-never-introspects-even-when-idp-down",
+      "why": "Reads stay available during an IdP outage. This is the behaviour that makes an outage survivable, so it must be pinned.",
+      "method": "GET", "require": { "site": "mu-back-office", "feature": "news-management" },
+      "token": { "role": "super_admin", "type": "admin", "siteAccess": {}, "valid": true },
+      "introspect": { "transport": "timeout" },
+      "expect": { "status": 200, "introspectCalled": false }
+    },
+
+    {
+      "id": "breaker-opens-after-5-transport-failures",
+      "why": "The 6th write short-circuits without another call, so a down IdP is not hammered.",
+      "sequence": [
+        { "method": "POST", "introspect": { "transport": "timeout" }, "expect": { "status": 503, "introspectCalled": true }, "repeat": 5 },
+        { "method": "POST", "introspect": { "transport": "timeout" }, "expect": { "status": 503, "introspectCalled": false } }
+      ],
+      "require": { "site": "mu-back-office", "feature": "news-management" },
+      "token": { "role": "super_admin", "type": "admin", "siteAccess": {}, "valid": true }
+    },
+    {
+      "id": "breaker-not-opened-by-revoked-tokens",
+      "why": "A stream of legitimately revoked tokens is a 2xx conversation. Letting it open the breaker would turn a normal condition into an outage.",
+      "sequence": [
+        { "method": "POST", "introspect": { "active": false, "reason": "token_revoked" }, "expect": { "status": 401, "introspectCalled": true }, "repeat": 10 }
+      ],
+      "require": { "site": "mu-back-office", "feature": "news-management" },
+      "token": { "role": "super_admin", "type": "admin", "siteAccess": {}, "valid": true }
+    },
+    {
+      "id": "breaker-half-open-after-window",
+      "why": "After the open window one trial is allowed, and a success closes the breaker.",
+      "sequence": [
+        { "method": "POST", "introspect": { "transport": "timeout" }, "expect": { "status": 503 }, "repeat": 5 },
+        { "advanceMs": 30001 },
+        { "method": "POST", "introspect": { "active": true, "adminId": "x", "role": "super_admin", "siteAccess": {}, "tokenVersion": 0 }, "expect": { "status": 200, "introspectCalled": true } },
+        { "method": "POST", "introspect": { "active": true, "adminId": "x", "role": "super_admin", "siteAccess": {}, "tokenVersion": 0 }, "expect": { "status": 200, "introspectCalled": true } }
+      ],
+      "require": { "site": "mu-back-office", "feature": "news-management" },
+      "token": { "role": "super_admin", "type": "admin", "siteAccess": {}, "valid": true }
+    },
+
+    {
+      "id": "unconfigured-refuses-not-allows",
+      "why": "A verifier missing its IdP base URL or introspect key must refuse every request. This is the fail-open bug that already exists elsewhere in the platform and must not be reproduced.",
+      "method": "GET", "require": { "site": "mu-back-office", "feature": "news-management" },
+      "token": { "role": "super_admin", "type": "admin", "siteAccess": {}, "valid": true },
+      "config": { "idpBaseUrl": "", "introspectApiKey": "" },
+      "expect": { "statusIn": [500, 503], "notStatus": 200 }
+    },
+    {
+      "id": "missing-scope-metadata-refuses",
+      "why": "A route wired without its site/feature metadata must 403 rather than fall through as unguarded.",
+      "method": "GET", "require": null,
+      "token": { "role": "admin", "type": "admin", "siteAccess": { "mu-back-office": ["news-management"] }, "valid": true },
+      "expect": { "status": 403 }
+    },
+    {
+      "id": "request-context-populated",
+      "why": "Downstream handlers and audit logging depend on these exact names being set from the token's sub, not from anywhere else.",
+      "method": "GET", "require": { "site": "mu-back-office", "feature": "news-management" },
+      "token": { "sub": "6c7b84de-9e3d-40ef-97eb-6bd47ae170a5", "role": "super_admin", "type": "admin", "siteAccess": {}, "valid": true },
+      "expect": { "status": 200, "context": { "adminId": "6c7b84de-9e3d-40ef-97eb-6bd47ae170a5", "adminRole": "super_admin", "adminSiteAccessPresent": true } }
+    }
+  ]
+}

@@ -1,0 +1,5 @@
+/rust/target
+/js/node_modules
+/js/dist
+.omc/
+.DS_Store

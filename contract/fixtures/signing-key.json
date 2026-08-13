@@ -1,0 +1,6 @@
+{
+  "_comment": "Test-only Ed25519 signing key generated for the admin-auth contract test suite (cases.json). This key has never signed anything real and must never be used outside these tests. Every implementation of the contract signs its 'good' tokens with this seed and publishes the matching public key in a JWKS document under kid.",
+  "kid": "ed-contract-test-1",
+  "seedHex": "568dc002e1ba0402e17b46a393f4ed1afb4e262a48c7cf75a44da1985830ea82",
+  "seedEncoding": "hex, 32 bytes, the Ed25519 private key seed (RFC 8032). Derive the public key from it to build the JWKS entry (kty=OKP, crv=Ed25519, x=base64url(pubkey))."
+}
