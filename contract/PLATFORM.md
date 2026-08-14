@@ -581,7 +581,7 @@ Where a limiter does exist today:
 |---|---|---|---|---|
 | `idp` | `POST /api/v1/oauth/google/start` | IP | `RATE_LIMIT_START_PER_MINUTE=20` | in-memory, per replica |
 | `idp` | `POST /api/v1/oauth/token` | IP | `RATE_LIMIT_TOKEN_PER_HOUR=60` | in-memory, per replica |
-| `keyServer` | `POST /v1/verify` | IP | `RATE_LIMIT_VERIFY_PER_MIN=120` | in-memory, per replica |
+| `keyServer` | `POST /v1/verify` | presented `mxs_` key (SHA-256 via `domain::hash_key`; IP fallback for bodies with no parseable `mxs_` candidate; 10k-bucket cap, fail-closed on *new* buckets at capacity) | `RATE_LIMIT_VERIFY_PER_MIN=120` (per key since `f3e2f7c` — was per IP, which under k8s SNAT would have collapsed every S2S caller onto a handful of node-IP buckets and, because callers treat non-200 as 503 fail-closed, turned the limit into a fleet-wide mutation outage) | in-memory, per replica |
 | `utility` | `POST /v1/partner/presign-upload` | IP | `PARTNER_PRESIGN_PER_HOUR=15` (documented exception, §1.5-style — see rule 2) | in-memory, per replica |
 | `web` | `POST /admin/user-reports` (public submission) | IP (salted hash) | `USER_REPORTS_PER_HOUR=10` (documented exception, same as above) | **Postgres** (`rate_limit_counters`) — survives restarts, correct across replicas |
 | `launcher` | `POST /maxgame-launcher-coupons/redeem` | `player_id` | `RATE_LIMIT_COUPON_REDEEM_PER_MIN=10` | in-memory, per replica |
@@ -634,26 +634,24 @@ Normative rules, extracted from the above rather than invented:
    `keyServer` and `utility`, which already used `TRUST_PROXY_HEADERS`.
    `grep -rn TRUST_FORWARDED_HEADERS` across the fleet today returns nothing
    outside git history.
-4. **Client-IP resolution order is not yet converged fleet-wide — two
-   patterns exist, and only one is recommended for new code.** `keyServer`,
-   `utility`, and `web` resolve `CF-Connecting-IP` → left-most
+4. **Client-IP resolution order: `CF-Connecting-IP` → left-most
    `X-Forwarded-For` hop → TCP peer, gated entirely behind
-   `TRUST_PROXY_HEADERS` (`maxgame-web-backend/src/modules/user_reports/rate_limit.rs:42-53`,
-   test `cloudflares_header_outranks_the_forwarded_chain`, is the reference
+   `TRUST_PROXY_HEADERS`.**
+   `maxgame-web-backend/src/modules/user_reports/rate_limit.rs:42-53` (test
+   `cloudflares_header_outranks_the_forwarded_chain`) is the reference
    implementation — Cloudflare overwrites its own header at the edge so a
    client cannot forge it, which is why it outranks the client-suppliable
-   XFF). `idp` and `authServer` instead resolve left-most `X-Forwarded-For` →
-   `X-Real-IP` → TCP peer, with no `CF-Connecting-IP` step at all
-   (`maxgame-admin-auth-server/src/inbound/extract.rs`,
-   `maxgame-auth-server/src/interface/middleware/rate_limit.rs` — the latter's
-   own doc comment says it mirrors idp's "byte for byte"). Both patterns
-   share the load-bearing property this rule actually requires: **a service
-   must never trust a proxy header unconditionally** — every implementation
-   above gates the header(s) behind `TRUST_PROXY_HEADERS` and falls back to
-   the TCP peer with it off. Converging the two patterns onto one order is
-   left as a follow-up, not required by this contract; a new limiter should
-   default to `web`'s `CF-Connecting-IP`-first order unless it has a specific
-   reason not to.
+   XFF. This order is now converged fleet-wide: `idp` and `authServer`
+   originally resolved XFF → `X-Real-IP` → peer with no `CF-Connecting-IP`
+   step (a gap the first revision of this section documented), and were
+   brought in line the same day (`maxgame-admin-auth-server` `4f9890e`,
+   `maxgame-auth-server` `e0807f3` — both keep `X-Real-IP` as a third
+   fallback after XFF, a harmless historical extra the reference
+   implementation simply doesn't have). The load-bearing property remains:
+   **a service must never trust a proxy header unconditionally** — every
+   implementation gates the headers behind `TRUST_PROXY_HEADERS` and falls
+   back to the TCP peer with it off, proven per repo by a
+   headers-are-ignored-when-untrusted test.
 5. **State honesty.** In-memory windows (`idp`, `keyServer`, `utility`,
    `launcher`) are per replica — the effective limit is the configured value
    × replica count — and are lost on restart. This is accepted by design for
@@ -668,8 +666,11 @@ Normative rules, extracted from the above rather than invented:
    `launcher`'s coupon-redeem limiter keys by `player_id`, not IP, precisely
    because the route sits behind player auth and an IP-keyed limiter would
    both be weaker (NAT/shared-IP false sharing) and unnecessary (the real
-   identity is already known) — the fleet's one example of identity-keyed
-   limiting today.
+   identity is already known). `keyServer`'s `/v1/verify` limiter is the
+   second example: it keys by the presented `mxs_` key (hashed), because the
+   unit of S2S identity is the key, not the socket — and under k8s SNAT the
+   socket address actively lies (every pod egresses as one of a handful of
+   node IPs).
 6. **A rate-limit value that fails to parse refuses to boot** — never a
    silent fallback to the default. This matches the fleet's general config
    convention (§3.4) rather than inventing a rate-limit-specific rule; e.g.
