@@ -316,20 +316,38 @@ template; sweep for it in M2 rather than assuming it is already gone.
 both default `PORT` to `8090` — that's `keyServer`'s port (§3.1 says `idp` is
 8091). M2: change the default to 8091 in both places.
 
-**Both `ADMIN_IDP_BASE_URL` and `ADMIN_JWKS_URL` must be https outside
-development.** `ADMIN_JWKS_URL` being https was already a rule (§3.4's
-guardrail list); `ADMIN_IDP_BASE_URL` itself was not separately checked,
-which left a gap: `ADMIN_INTROSPECT_PATH` defaults to a path *relative to
-`ADMIN_IDP_BASE_URL`*, so a plaintext base URL is a token-forgery path on
-the introspection call even when `ADMIN_JWKS_URL` is explicitly overridden
-to something safe. Both checks are independent and both required — one
-does not excuse the other. Reference implementation:
-`maxion-admin-guard/template/src/config.rs`'s `validate()`, which checks
-`admin_idp.base_url` immediately before the existing `admin_idp.jwks_url`
-check, plus the test
-`an_explicit_https_jwks_url_does_not_excuse_a_plaintext_base_url` proving
-the two are independent. Every repo with this env set should carry the
-same pair of checks.
+**Every IdP URL the service resolves — `jwks_url` and `introspect_url` —
+must be https outside development, validated at the resolved value, not
+the raw input env var.** `ADMIN_JWKS_URL` being https was already a rule
+(§3.4's guardrail list); `introspect_url` (built from `ADMIN_IDP_BASE_URL`
++ `ADMIN_INTROSPECT_PATH`) was not separately checked, which left a gap: an
+https `ADMIN_JWKS_URL` override did not stop a plaintext `ADMIN_IDP_BASE_URL`
+from being a token-forgery path on the introspection call. The fix checks
+the two *resolved* struct fields (`admin_idp.jwks_url`,
+`admin_idp.introspect_url`) directly rather than checking
+`ADMIN_IDP_BASE_URL` as a proxy for them — checking the resolved value is
+what stays correct even if a future change to how a URL is built forgets to
+preserve the scheme, instead of relying on every call site to remember the
+invariant. There is no `ADMIN_INTROSPECT_PATH` absolute-URL passthrough (a
+path is always joined onto the base, never used in place of it), so today
+`introspect_url`'s scheme can only come from `ADMIN_IDP_BASE_URL` — but the
+check does not depend on that staying true.
+
+A related bug in the same code path: `ADMIN_INTROSPECT_PATH` used to
+concatenate straight onto the base URL (`{base}{path}`), so a value missing
+its leading slash (`admin/introspect` instead of `/admin/introspect`)
+silently produced a broken URL with no path separator at all — not an
+error, just a URL that resolves nowhere real. Fixed by joining the two
+pieces through a helper that tolerates the missing slash.
+
+Reference implementation: `maxion-admin-guard/template/src/config.rs`'s
+`validate()` (the resolved-value checks) and `join_url` (the leading-slash
+tolerance, and its doc comment for the no-passthrough guarantee), plus the
+tests `an_explicit_https_jwks_url_does_not_excuse_a_plaintext_base_url`,
+`admin_introspect_path_is_never_an_absolute_url_override`,
+`join_url_tolerates_a_path_missing_its_leading_slash`, and
+`admin_introspect_path_without_a_leading_slash_still_resolves_correctly`.
+Every repo with this env set should carry the same checks.
 
 ### 3.4 `AppEnv`: three tiers, guardrails keyed off `!is_dev()`
 
@@ -553,20 +571,35 @@ cover; it should be concrete enough to write from directly.
 - [ ] `APP_ENV` is required (no silent default to `Development`); `staging`
       and `uat` both parse to `AppEnv::Staging`, not `Development`; `test`
       is rejected outright, never silently mapped to any tier; every
-      deployment guardrail (Swagger off, HTTPS JWKS, HTTPS IdP base URL,
+      deployment guardrail (Swagger off, every resolved IdP URL over https,
       non-empty CORS allowlist, etc.) fires identically for `staging` and
       `production` — i.e. is keyed off `!is_dev()`, verified by a test that
       runs the same guardrail assertions against both tiers.
-- [ ] Outside `Development`, both `ADMIN_IDP_BASE_URL` and `ADMIN_JWKS_URL`
-      are checked for `https://`, **independently** — an https
+- [ ] Outside `Development`, every IdP URL the service resolves — `jwks_url`
+      and `introspect_url`, not the raw `ADMIN_IDP_BASE_URL`/
+      `ADMIN_JWKS_URL`/`ADMIN_INTROSPECT_PATH` input env vars — must be
+      `https://`, checked **independently** at the resolved value: an https
       `ADMIN_JWKS_URL` override must not excuse a plaintext
-      `ADMIN_IDP_BASE_URL` (the introspection endpoint defaults to a path
-      relative to the base URL, so a plaintext base URL is still a
-      token-forgery path even when the JWKS fetch itself is safe). See
-      §3.3 and `template/src/config.rs`'s `validate()` for the reference
-      pair of checks and `template/src/config.rs`'s
-      `an_explicit_https_jwks_url_does_not_excuse_a_plaintext_base_url`
-      test for the independence proof.
+      `ADMIN_IDP_BASE_URL`, because `introspect_url` still inherits the
+      base URL's scheme (there is no `ADMIN_INTROSPECT_PATH` absolute-URL
+      passthrough — a path is always joined onto the base, never used in
+      place of it). Checking the resolved values rather than only
+      `ADMIN_IDP_BASE_URL` is what keeps this correct even if a future
+      change to how a URL is built forgets to preserve the scheme, instead
+      of relying on every call site to remember the invariant. See §3.3 and
+      `template/src/config.rs`'s `validate()` for the reference pair of
+      checks, `join_url`'s doc comment for the no-passthrough guarantee,
+      and `template/src/config.rs`'s
+      `an_explicit_https_jwks_url_does_not_excuse_a_plaintext_base_url` and
+      `admin_introspect_path_is_never_an_absolute_url_override` tests for
+      the independence and no-passthrough proofs.
+- [ ] `ADMIN_INTROSPECT_PATH` tolerates a value missing its leading slash
+      (`admin/introspect` as well as the correct `/admin/introspect`)
+      rather than silently concatenating into a broken URL with no path
+      separator at all. See `template/src/config.rs`'s `join_url` and its
+      `join_url_tolerates_a_path_missing_its_leading_slash` /
+      `admin_introspect_path_without_a_leading_slash_still_resolves_correctly`
+      tests.
 - [ ] Admin-auth: a request with no `Authorization` header is 401; a request
       whose token fails offline verification (bad `kid`, expired, wrong
       `iss`) is 401; an unreachable/erroring JWKS endpoint is 503, not 401

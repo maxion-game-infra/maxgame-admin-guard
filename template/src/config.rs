@@ -24,6 +24,26 @@ const DEFAULT_INTROSPECT_PATH: &str = "/api/v1/oauth/introspect";
 /// `openssl rand -base64 32` produces at its shortest useful encoding.
 const MIN_DEPLOYED_SECRET_LEN: usize = 32;
 
+/// Join a base URL and a path fragment, tolerating a caller-supplied path
+/// that omits its leading slash. Concatenating straight into
+/// `{idp_base_url}{path}` silently produces a broken URL when the slash is
+/// missing — `ADMIN_INTROSPECT_PATH=admin/introspect` on base
+/// `https://api.example` used to resolve to
+/// `https://api.exampleadmin/introspect` (no separator at all, not an
+/// error, just a URL that resolves nowhere real).
+///
+/// This is deliberately *not* an absolute-URL passthrough: `path` is
+/// always joined onto `base`, never used verbatim in place of it, so
+/// `ADMIN_INTROSPECT_PATH` can never point this service at a host other
+/// than `ADMIN_IDP_BASE_URL`.
+fn join_url(base: &str, path: &str) -> String {
+    if path.starts_with('/') {
+        format!("{base}{path}")
+    } else {
+        format!("{base}/{path}")
+    }
+}
+
 /// Which environment this process is running in.
 ///
 /// The load-bearing distinction is **development versus deployed**, not
@@ -171,7 +191,7 @@ impl Config {
                     let path = env
                         .get("ADMIN_INTROSPECT_PATH")
                         .unwrap_or_else(|| DEFAULT_INTROSPECT_PATH.into());
-                    format!("{idp_base_url}{path}")
+                    join_url(&idp_base_url, &path)
                 },
                 introspect_api_key: required(env, "ADMIN_INTROSPECT_API_KEY")?,
                 base_url: idp_base_url,
@@ -207,18 +227,31 @@ impl Config {
         if !self.app_env.is_dev() {
             let env = self.app_env.as_str();
 
-            if !self.admin_idp.base_url.starts_with("https://") {
-                return Err(DomainError::Internal(format!(
-                    "ADMIN_IDP_BASE_URL must be https in {env}: it is also where the \
-                     introspection endpoint lives when ADMIN_INTROSPECT_PATH is left at its \
-                     default, so a plaintext base URL is a token-forgery path even when \
-                     ADMIN_JWKS_URL is overridden to something safe"
-                )));
-            }
+            // Every IdP URL this service actually resolves — not the raw
+            // input env vars — must be https. Checking the *resolved*
+            // values (rather than e.g. only ADMIN_IDP_BASE_URL) is what
+            // catches every path a plaintext scheme could reach these
+            // fields through, including ones that don't exist yet: this
+            // service has no ADMIN_INTROSPECT_PATH absolute-URL passthrough
+            // (see `join_url`'s doc comment), so today `introspect_url`'s
+            // scheme can only ever come from `ADMIN_IDP_BASE_URL` — but
+            // checking the resolved value directly means that stays true
+            // even if a future change to how `introspect_url` is built
+            // forgets to preserve it, instead of relying on every caller of
+            // this function to remember the invariant.
             if !self.admin_idp.jwks_url.starts_with("https://") {
                 return Err(DomainError::Internal(format!(
-                    "ADMIN_JWKS_URL must be https in {env}: the signing keys arrive over it, \
-                     so a plaintext fetch is a token-forgery path"
+                    "the resolved ADMIN_JWKS_URL must be https in {env}: the signing keys \
+                     arrive over it, so a plaintext fetch is a token-forgery path (got '{}')",
+                    self.admin_idp.jwks_url
+                )));
+            }
+            if !self.admin_idp.introspect_url.starts_with("https://") {
+                return Err(DomainError::Internal(format!(
+                    "the resolved introspection URL must be https in {env} — check \
+                     ADMIN_IDP_BASE_URL (its scheme is what ADMIN_INTROSPECT_PATH resolves \
+                     against): got '{}'",
+                    self.admin_idp.introspect_url
                 )));
             }
             if self.cors_allowed_origins.is_empty() {
@@ -343,10 +376,18 @@ mod tests {
     #[test]
     fn every_deployed_environment_gets_the_same_guardrails() {
         for app_env in ["staging", "uat", "production"] {
+            // A plaintext base URL with no ADMIN_JWKS_URL override makes
+            // the *resolved* jwks_url plaintext too (it derives from the
+            // base URL the same way introspect_url does), so this is
+            // caught by the ADMIN_JWKS_URL check below, not a separate
+            // base_url-specific one — see
+            // `an_explicit_https_jwks_url_does_not_excuse_a_plaintext_base_url`
+            // for the case where an explicit https ADMIN_JWKS_URL override
+            // isolates the introspection-URL check instead.
             let mut plaintext_base_url = deployed(app_env);
             plaintext_base_url.insert("ADMIN_IDP_BASE_URL".into(), "http://api.maxion.game".into());
             let err = Config::load(&plaintext_base_url).unwrap_err().to_string();
-            assert!(err.contains("ADMIN_IDP_BASE_URL"), "{app_env}: {err}");
+            assert!(err.contains("ADMIN_JWKS_URL"), "{app_env}: {err}");
 
             let mut plaintext_jwks = deployed(app_env);
             plaintext_jwks.insert(
@@ -386,7 +427,58 @@ mod tests {
             "https://api.maxion.game/.well-known/jwks.json".into(),
         );
         let err = Config::load(&env).unwrap_err().to_string();
+        // Specifically the introspection-URL check, not the JWKS one — this
+        // is the case that isolates it: with ADMIN_JWKS_URL explicitly
+        // overridden to https, the JWKS check passes, so only checking the
+        // *resolved* introspect_url value catches the plaintext base URL.
+        assert!(err.contains("introspection"), "{err}");
         assert!(err.contains("ADMIN_IDP_BASE_URL"), "{err}");
+    }
+
+    #[test]
+    fn join_url_tolerates_a_path_missing_its_leading_slash() {
+        assert_eq!(
+            join_url("https://api.example", "/admin/introspect"),
+            "https://api.example/admin/introspect"
+        );
+        assert_eq!(
+            join_url("https://api.example", "admin/introspect"),
+            "https://api.example/admin/introspect",
+            "a missing leading slash must not silently glue onto the host"
+        );
+    }
+
+    #[test]
+    fn admin_introspect_path_without_a_leading_slash_still_resolves_correctly() {
+        let mut env = minimal();
+        env.insert("ADMIN_INTROSPECT_PATH".into(), "admin/introspect".into());
+        let config = Config::load(&env).unwrap();
+        assert_eq!(
+            config.admin_idp.introspect_url, "https://api.maxion.game/admin/introspect",
+            "a missing leading slash on ADMIN_INTROSPECT_PATH must not silently break the URL"
+        );
+    }
+
+    /// `ADMIN_INTROSPECT_PATH` is joined onto `ADMIN_IDP_BASE_URL`, never
+    /// used in place of it — this service has no absolute-URL passthrough.
+    /// A value that merely *looks* absolute (starts with `http`) is still
+    /// just a path segment glued onto the base, not a host override.
+    #[test]
+    fn admin_introspect_path_is_never_an_absolute_url_override() {
+        let mut env = minimal();
+        env.insert(
+            "ADMIN_INTROSPECT_PATH".into(),
+            "http://attacker.example/introspect".into(),
+        );
+        let config = Config::load(&env).unwrap();
+        assert!(
+            config
+                .admin_idp
+                .introspect_url
+                .starts_with("https://api.maxion.game/"),
+            "ADMIN_INTROSPECT_PATH must never redirect this service to a different host: got '{}'",
+            config.admin_idp.introspect_url
+        );
     }
 
     #[test]
