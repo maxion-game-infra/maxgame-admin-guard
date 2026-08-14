@@ -1,0 +1,63 @@
+[package]
+name = "maxgame-template-server"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+publish = false
+
+[lib]
+name = "template_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "maxgame-template-server"
+path = "src/main.rs"
+
+[dependencies]
+# Shared admin-auth verifier (offline JWKS/EdDSA verification, live
+# introspection, circuit breaker, site/feature authorization). Implements
+# the contract in ../contract/README.md — every service on the platform
+# uses this, template included.
+#
+# ⚠️ THIS PATH IS RELATIVE TO WHERE THIS FILE LIVES, AND IT CHANGES WHEN
+# YOU COPY THE TEMPLATE OUT. `template/` sits *inside* `maxion-admin-guard/`,
+# so from here the crate is `../rust`. A new service copied out to become a
+# sibling repo (`maxgame-foo-server/`, next to `maxion-admin-guard/` the way
+# every other backend on the platform is) needs `../maxion-admin-guard/rust`
+# instead — one more `../maxion-admin-guard` segment. Forgetting this is a
+# `cargo build` error naming this exact line, not a silent bug: no change is
+# invisible.
+maxion-admin-guard = { path = "../rust" }
+axum = { version = "0.8", features = ["macros"] }
+tokio = { version = "1", features = ["full"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sqlx = { version = "0.8", features = [
+    "runtime-tokio",
+    "tls-rustls",
+    "postgres",
+    "uuid",
+    "chrono",
+    "migrate",
+] }
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+    "json",
+] }
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+dotenvy = "0.15"
+
+[dev-dependencies]
+# The IdP is mocked at the HTTP boundary, so the tests exercise the real
+# JWKS client, verifier and introspection client — not a fake port.
+wiremock = "0.6"
+http-body-util = "0.1"
+# Minting test tokens the way the IdP does: Ed25519 over a base64url JWT.
+ed25519-dalek = { version = "2", features = ["std"] }
+base64 = "0.22"

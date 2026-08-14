@@ -1,0 +1,10 @@
+/target
+**/*.rs.bk
+
+# Real configuration and secrets never enter git. `.env.example` (placeholders
+# only) is the tracked template.
+.env
+.env.*
+!.env.example
+
+.DS_Store

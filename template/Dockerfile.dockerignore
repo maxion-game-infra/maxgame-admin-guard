@@ -1,0 +1,25 @@
+# Build-context filter for the Dockerfile beside this file.
+#
+# BuildKit reads `<dockerfile>.dockerignore` in preference to the context
+# root's `.dockerignore` — which matters here, because the context is
+# `maxion-admin-guard/` (see the Dockerfile header), which also holds `js/`,
+# `contract/`, and this same `template/` tree's own `target/`. Without this,
+# `docker build` would upload all of it.
+#
+# Ignore everything, then admit only the two trees the build needs.
+*
+
+!rust
+!template
+
+# …minus what must never enter a build context.
+rust/target
+rust/.git
+template/target
+template/.git
+template/.env
+template/.env.*
+template/tests
+**/*.md
+
+**/.DS_Store
