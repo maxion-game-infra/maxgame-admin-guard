@@ -202,7 +202,13 @@ impl Rig {
     async fn build(fixture: &Fixture, case: &Value) -> Self {
         let jwks_server = MockServer::start().await;
         let jwks_path = fixture.top_config["jwksPath"].as_str().unwrap();
-        mount_jwks(&jwks_server, jwks_path, fixture.jwks_body(), case.get("jwks")).await;
+        mount_jwks(
+            &jwks_server,
+            jwks_path,
+            fixture.jwks_body(),
+            case.get("jwks"),
+        )
+        .await;
 
         let introspect_server = MockServer::start().await;
 
@@ -294,7 +300,12 @@ impl Rig {
 /// acted on: every case already gets a brand-new [`AdminJwksClient`] in
 /// [`Rig::build`], so the cache is cold by construction and this harness has
 /// no way to pre-warm it.
-async fn mount_jwks(server: &MockServer, jwks_path: &str, fixture_body: Value, spec: Option<&Value>) {
+async fn mount_jwks(
+    server: &MockServer,
+    jwks_path: &str,
+    fixture_body: Value,
+    spec: Option<&Value>,
+) {
     if let Some(spec) = spec {
         assert_eq!(
             spec.get("coldCache").and_then(Value::as_bool),
@@ -303,7 +314,10 @@ async fn mount_jwks(server: &MockServer, jwks_path: &str, fixture_body: Value, s
         );
     }
 
-    let template = match spec.and_then(|s| s.get("transport")).and_then(Value::as_str) {
+    let template = match spec
+        .and_then(|s| s.get("transport"))
+        .and_then(Value::as_str)
+    {
         None => ResponseTemplate::new(200).set_body_json(fixture_body),
         Some("timeout") => ResponseTemplate::new(200).set_delay(MOCK_TIMEOUT_DELAY),
         Some("http") => {
