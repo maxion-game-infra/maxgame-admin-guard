@@ -594,6 +594,34 @@ error, non-2xx, and an unparseable body all map to the same
 `DomainError::Unavailable("unable to verify the service key with
 maxgame-key-server")`. Only a clean `{"active": false, ...}` is a denial.
 
+### 6.2b The S2S HTTP client must refuse redirects
+
+Every `reqwest::Client` used for an S2S call — key-server verify, admin
+introspection, JWKS fetch, any provider call carrying a secret — must be built
+with `.redirect(reqwest::redirect::Policy::none())`.
+
+This is not hygiene, it is a credential-exfiltration boundary. reqwest's
+default is `Policy::limited(10)`, and on a 307/308 it re-sends the **method,
+body, and custom headers** to the new target. It strips only `Authorization`
+and `Cookie`, and only cross-host. That leaves exposed:
+
+- the admin access token, which `AdminIntrospectClient` sends in the JSON
+  **body**, and the introspect secret, which it sends as the custom header
+  `x-api-key` (`rust/src/introspect_client.rs`);
+- any service key sent in a request body, e.g. the plaintext `mxs_` key in
+  `/v1/verify`'s body.
+
+It also routes around §3.3's https guardrails, which validate the *configured*
+URL and cannot see where a redirect leads — the same class of gap as the
+`absolute_url` passthrough. Anyone able to make the configured host answer a
+redirect (a compromised pod, DNS spoofing, a misconfigured ingress or CDN)
+collects live admin sessions and service keys without holding any credential.
+
+No S2S call in this platform legitimately redirects. Found fleet-wide by
+security review on 2026-08-14 (no repo set a policy) and fixed across all
+seven Rust services; each carries a test that points its client at a mock
+answering 307/308 and asserts the redirect target receives nothing.
+
 ### 6.3 Scope catalog
 
 ```
@@ -691,6 +719,15 @@ cover; it should be concrete enough to write from directly.
       `admin_introspect_path_is_never_an_absolute_url_override` tests (the
       latter proving the template's own, stricter no-passthrough design,
       not a platform-wide guarantee).
+- [ ] Every `reqwest::Client` carrying a credential is built with
+      `.redirect(reqwest::redirect::Policy::none())` (§6.2b), with a test
+      pointing it at a mock that answers 307/308 and asserting the redirect
+      target receives nothing and the call fails closed. The https checks
+      above validate the *configured* URL and cannot see past a redirect, so
+      without this the credential in the request **body** (admin token,
+      `mxs_` key) and the `x-api-key` **header** are forwarded to whatever
+      the configured host names next — reqwest strips only `Authorization`
+      and `Cookie`, and only cross-host.
 - [ ] `ADMIN_INTROSPECT_PATH` tolerates a value missing its leading slash
       (`admin/introspect` as well as the correct `/admin/introspect`)
       rather than silently concatenating into a broken URL with no path
