@@ -256,7 +256,7 @@ deployed, so this is free to change.
 | `web` | 8094 | `/healthz` | `/readyz` | `maxgame-web-backend` |
 | `utility` | 8095 | `/healthz` | `/readyz` | `maxgame-utility-server` |
 | `mailer` | 8096 | `/healthz` | `/readyz` | `maxgame-mail-server` (also serves the legacy `/health` at root, because the Node relay's clients and its runbooks use that path — additive, not a replacement) |
-| `api` | 8080 | `/health` (legacy name, not `/healthz` — not converging, being retired) | — | `web-platform-backend` |
+| `api` | 8080 | `/healthz` (`/health` kept as a legacy alias) | `/readyz` | `web-platform-backend` (being retired) |
 | SPA | 5173 | `/` | — | `web-platform-back-office` |
 
 Source: `back-office-workspace/.scripts/dev.sh:34-44` (`SERVICES` array,
@@ -267,6 +267,54 @@ was read straight out of it, not inferred).
 up") and `/readyz` (readiness — "can serve traffic") **at the root**, always,
 even once `BASE_PATH` (§5) is set — a k8s probe hits the pod directly, never
 through the gateway prefix.
+
+**Body shape.** Until now this section pinned only the *paths* — never the
+*bodies* — and that omission is exactly how four services drifted without
+anything failing: one answered `/healthz` in `text/plain` where every other
+repo answered JSON, and two more used non-standard readiness keys. The
+bodies are now part of the contract:
+
+```json
+GET /healthz → 200 {"status": "ok"}
+```
+
+`/healthz` **never touches a dependency** — that's the whole point of
+separating it from `/readyz` (the "Rule" above): a liveness probe that pings
+a database turns that database's blip into every pod's restart.
+
+```json
+GET /readyz → 200 {"status": "ready"}
+GET /readyz → 503 {"status": "unavailable", "dependency": "<name>"}
+```
+
+A service **may add fields to either response** (additive only) but **must
+not rename or drop `status`**, and on the 503 branch must not drop
+`dependency`. Three sanctioned additions exist today, kept deliberately
+rather than converged away:
+
+- **`utility`** answers `{"status": "ready", "buckets": N}` on `/readyz`
+  and has **no 503 branch at all** — it has no runtime dependency to fail
+  against (an empty bucket registry refuses to boot, so a started replica
+  always has *a* registry), so `buckets` is the entire readiness signal: the
+  count is how a rolling deploy shows a replica still running a stale
+  `R2_BUCKETS`. Source: `maxgame-utility-server/src/inbound/health.rs`.
+- **`authServer`** keeps `postgres_write`/`postgres_read`/`redis` on
+  `/readyz` alongside the standard `status`/`dependency` keys, deliberately,
+  for backward compatibility with a production deployment that already
+  parses those three fields. Source:
+  `maxgame-auth-server/src/interface/routes/mod.rs`.
+- **`mailer`** also serves the legacy `/health` at root — the Node relay's
+  own document shape (`{"status", "service", "time", "config": {...}}`),
+  unrelated in shape to `/healthz`/`/readyz` — additive, kept because
+  existing runbooks and uptime checks call that path. Source:
+  `maxgame-mail-server/src/inbound/health.rs`.
+
+`api` (NestJS) carries a fourth, platform-wide alias rather than a
+service-specific addition: its pre-existing `/health` → `{"ok": true}` stays
+as a legacy alias alongside the new standard `/healthz`/`/readyz` pair, for
+the same reason as `mailer`'s — an existing caller reads it, and converging
+the *body* shape doesn't require migrating that caller off the old path.
+Source: `web-platform-backend/src/app.controller.ts`.
 
 `dev.sh` gates `make up` on `/healthz` for every service *except*
 `key-server`, which it gates on `/readyz` on purpose (comment at
@@ -464,6 +512,55 @@ guardrails), per the reasoning above: `test` is deliberately not a
 recognized spelling anywhere on the platform, because it reads as a
 deployed QA environment at least as often as a laptop.
 
+### 3.5 Swagger / OpenAPI mount
+
+Every service that ships Swagger mounts the UI at **`/docs`** and serves the
+spec at **`/docs/openapi.json`** — hardcoded, no env override. `SWAGGER_PATH`
+existed as a per-repo env var before this and is now retired platform-wide;
+there is nothing left to configure.
+
+Because the Swagger router is merged into each service's app **before** the
+`BASE_PATH` nest (§5.2), the path a client calls once deployed is
+`<BASE_PATH>/docs`, not a bare `/docs` — the hardcoded value is what the
+service mounts at its own root, the same way `/healthz`/`/readyz` are
+rooted (§3.1) but, unlike them, Swagger **does** move under `BASE_PATH`
+when one is set.
+
+| Repo | Mounted at | Spec at | Gated by | Default |
+|---|---|---|---|---|
+| `idp` | `/docs` | `/docs/openapi.json` | `SWAGGER_ENABLED` | `false` |
+| `launcher` | `/docs` | `/docs/openapi.json` | `SWAGGER_ENABLED` | `false` |
+| `news` | `/docs` | `/docs/openapi.json` | `SWAGGER_ENABLED` | `false` |
+| `utility` | `/docs` | `/docs/openapi.json` | `SWAGGER_ENABLED` | `false`, and refuses to boot with it `true` outside `Development` (§3.4) |
+| `keyServer` | `/docs` | `/docs/openapi.json` | `SWAGGER_ENABLED` | `false`, same production refusal as `utility` |
+| `authServer` | `/docs` | `/docs/openapi.json` | `OPENAPI_ENABLED` | **`true`** — deviation, see below |
+| `web` | — (no Swagger) | — | — | — |
+| `mailer` | — (no Swagger) | — | — | — |
+| `api` (NestJS) | `/docs` (coincidentally the same path, via `@nestjs/swagger`'s own convention — not converged to this rule) | `/docs-json` (Nest's default, not `/docs/openapi.json`) | `APP_ENV !== 'production'` (its own gate, not `SWAGGER_ENABLED`) | enabled whenever `APP_ENV` isn't exactly `production` |
+
+Source: `SwaggerUi::new("/docs").url("/docs/openapi.json", ...)` in each
+Rust repo's router (`idp` `src/inbound/router.rs:90`, `launcher`
+`src/inbound/router.rs:30`, `news` `src/inbound/router.rs:32`, `utility`
+`src/inbound/router.rs:29`, `keyServer` `src/app.rs:66`, `authServer`
+`src/interface/routes/mod.rs:146`); `web-platform-backend/src/main.ts:39-45`
+and `src/libs/swagger/swagger.ts` for `api`.
+
+**Known gap — `authServer` has not converged, on purpose.** It still gates
+its mount with `OPENAPI_ENABLED` (`src/infrastructure/config/mod.rs:102`,
+default `true`), not the fleet's `SWAGGER_ENABLED` (default `false`), and —
+unlike `utility`/`keyServer` — has **no guardrail refusing to boot with it
+enabled outside `Development`**. This is a real, open non-conformance, not
+a documented exception: `authServer` is a live production deployment
+(§2's `FROZEN` note, §5.4), and renaming or re-defaulting an env var there
+was out of scope for the round of work that converged the other six repos.
+Tracked here so the next pass on this repo doesn't have to rediscover it.
+
+**Services with no Swagger at all**, so a reader doesn't mistake the blank
+row above for a gap: `web` (`maxgame-web-backend`), `mailer`
+(`maxgame-mail-server`), and the `template` (M6) scaffold. `api`'s Swagger
+is real but is NestJS's own framework convention, predates this rule, and
+is not being converged — the service is being retired (§1.5, §2.4).
+
 ---
 
 ## 4. Admin authentication
@@ -617,6 +714,26 @@ URL and cannot see where a redirect leads — the same class of gap as the
 redirect (a compromised pod, DNS spoofing, a misconfigured ingress or CDN)
 collects live admin sessions and service keys without holding any credential.
 
+**The JWKS fetch is not a lower-risk case of this, even though it carries no
+credential of its own.** It is tempting to reason that a client with no
+secret in the request needs less protection than one sending a token or an
+`x-api-key` — that reasoning is backwards. A redirected JWKS fetch lets an
+attacker serve their **own** key set, which every verifier that trusts it
+will then accept as the set of valid signing keys — i.e. mint admin tokens
+the service treats as genuine. That is a total auth bypass requiring **no
+credential at all**, strictly more severe than leaking one admin's token or
+one service key, both of which are scoped and revocable. The protection
+already covers this call transitively within each service — a repo
+typically builds **one** `reqwest::Client` with the policy set once (e.g.
+`maxgame-utility-server/src/inbound/state.rs`'s `AppState::new`) and clones
+it into the JWKS client, the introspect client, and the key-server client
+alike, so no call site opts in separately. That is a per-repo implementation
+convenience, not a fleet-wide shared HTTP client (D0 — there is no such
+thing on this platform); the point is not to rely on it but to make sure
+the JWKS case is never recorded as "lower risk" and quietly dropped from
+§6.2b's scope — the rule already names the JWKS fetch explicitly, and this
+paragraph exists so that stays true.
+
 No S2S call in this platform legitimately redirects. Found fleet-wide by
 security review on 2026-08-14 (no repo set a policy) and fixed across all
 seven Rust services; each carries a test that points its client at a mock
@@ -682,9 +799,20 @@ cover; it should be concrete enough to write from directly.
       applicable) carries `Retry-After` in seconds.
 - [ ] `GET /healthz` and `GET /readyz` both exist at the root and return 2xx
       when the service is healthy, independent of `BASE_PATH`.
+- [ ] `GET /healthz` answers exactly `{"status": "ok"}` and never queries a
+      dependency; `GET /readyz` answers `{"status": "ready"}` on 200 and
+      `{"status": "unavailable", "dependency": "<name>"}` on 503, with any
+      repo-specific extra fields present but `status`/`dependency` neither
+      renamed nor dropped (§3.1's body shape) — e.g. `utility`'s `buckets`
+      field and no-503-branch, `authServer`'s three extra dependency flags.
 - [ ] Booting with `BASE_PATH=/x` set: every existing route answers under
       `/x/...`, and `/healthz`+`/readyz` still answer at the root (unset
       `BASE_PATH` must be behaviourally identical to today).
+- [ ] If this repo ships Swagger: it is mounted at `/docs` with the spec at
+      `/docs/openapi.json`, hardcoded — no `SWAGGER_PATH` or equivalent env
+      var exists to override either path (§3.5). Booting with `BASE_PATH=/x`
+      set, the mount answers at `/x/docs` (Swagger nests under `BASE_PATH`
+      like every other route — only the two health probes are exempt).
 - [ ] CORS: `allow_headers` includes `authorization, content-type, accept,
       x-request-id` (plus any repo-specific extra, e.g. utility's
       `x-api-key`); a literal `*` in `CORS_ALLOWED_ORIGINS` refuses to boot;
