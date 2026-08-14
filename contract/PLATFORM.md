@@ -88,13 +88,17 @@ retry later); a 500's `message` never is. Source: launcher
 | `RATE_LIMIT_EXCEEDED` | 429 |
 | `SERVICE_UNAVAILABLE` | 503 |
 | `INTERNAL_ERROR` | 500 |
+| `CONFLICT` | 409 |
 
-Source: `maxgame-utility-server/src/inbound/error.rs` (`DomainError::error_code`).
+Source: `maxgame-utility-server/src/inbound/error.rs` (`DomainError::error_code`) for the first eight. `CONFLICT` was added by `maxgame-key-server` (`src/error.rs`, `src/routes/admin_keys.rs` — its one 409 case, "key is already revoked") during M2, since the original eight had no 409 entry; sanctioned as a contract amendment rather than a repo-local invention, so the next repo with a 409 reuses it instead of picking its own string.
 
-### 1.4 Non-conformance found (M2 work)
+### 1.4 Non-conformance found and fixed during M2/M3
 
-- **utility** answers `{"error": {"code": 422, "message": "…", "error_code": "UNPROCESSABLE_ENTITY"}}` today (nested, nod to `web-cs-backend`'s shape) — `back-office`'s `messageFrom()` cannot read a nested `error.message`, so **every utility error currently renders as "Something went wrong!"**. M2 target: flatten to §1.1's shape, keep `error_code`'s values as the new `code` field verbatim (only the envelope shape changes, not the vocabulary). Source: `maxgame-utility-server/src/inbound/error.rs:1-8` (doc comment names the shape explicitly).
-- **key-server**'s admin-keys errors (`AdminKeysError` in `src/routes/admin_keys.rs:69-98`) are ad hoc and match neither shape: `{"error": "unknown_scope", "scope": "..."}`, `{"error": "invalid_grace_hours", "message": "..."}`, `{"error": "already_revoked"}` — no `statusCode` field at all. A `500` from `AdminKeysError::Db` returns a bare status with **no body**. M2 target: same §1.1 envelope as the rest of the fleet. (This was not flagged in the original audit — found while writing this document; add it to key-server's M2 scope alongside the pagination/429 fixes already known.)
+These were identified while writing this document (M1) or during M2 implementation, and closed as part of the convergence work rather than left open:
+
+- **utility** answered `{"error": {"code": 422, "message": "…", "error_code": "UNPROCESSABLE_ENTITY"}}` (nested, nod to `web-cs-backend`'s shape) before M2 — `back-office`'s `messageFrom()` could not read a nested `error.message`, so every utility error rendered as "Something went wrong!". Fixed: flattened to §1.1's shape, `error_code`'s values carried over verbatim into the new `code` field.
+- **key-server**'s admin-keys errors (`AdminKeysError`) were ad hoc and matched neither shape: `{"error": "unknown_scope", "scope": "..."}`, `{"error": "invalid_grace_hours", "message": "..."}`, `{"error": "already_revoked"}` — no `statusCode` field at all, and a `500` from `AdminKeysError::Db` returned a bare status with no body. Fixed: same §1.1 envelope as the rest of the fleet, via the shared `error_response()` builder in `src/error.rs`.
+- **idp**'s non-OAuth admin routes (e.g. `/api/v1/me`, `/api/v1/admins`) answered `{"error": "<snake_case code>", "message": "<detail>"}` — no `statusCode`, and `error` carried a machine code rather than the HTTP reason phrase. Not caught while writing this document (a miss in M1, not something the M2 convergence commit introduced); found while writing idp's M5 conformance test, reported, and fixed the same day — `code` is now where the machine code lives, additive per §1.1.
 
 ### 1.5 Documented exceptions
 
@@ -177,12 +181,15 @@ deployed, so this is free to change.
 
   ```json
   // GET /admin/user-reports?limit=20&cursor=<uuid>
-  { "items": [ /* UserReportResponse[] */ ], "next_cursor": "3f6c2a1e-…", "has_more": true }
+  { "items": [ /* UserReportResponse[] */ ], "nextCursor": "3f6c2a1e-…", "hasMore": true }
   ```
 
   Source: `maxgame-web-backend/src/modules/user_reports/dto.rs`
   (`RawListQuery { site, limit, cursor }`, `UserReportListResponse { items,
-  next_cursor, has_more }`). The back office's user-reports page is a
+  next_cursor, has_more }` — the struct fields are snake_case but
+  `#[serde(rename_all = "camelCase")]` makes the wire shape `nextCursor`/
+  `hasMore`, consistent with every other camelCase response on this
+  platform). The back office's user-reports page is a
   load-more UI (`sections/max-user-report/view/user-report-view.tsx`), so
   converging to a page-number UI would be a UI rework, not a wire-format
   fix — deferred to plan follow-up §7 item 7. `web`'s **careers** admin list
@@ -534,6 +541,9 @@ cover; it should be concrete enough to write from directly.
       D4.2 — the issuer-conformance test); mutating one field of the minted
       token must make that same test fail (proves the test isn't vacuous).
 - [ ] No `aud` claim is ever minted.
+- [ ] idp's own non-OAuth admin routes (e.g. `/api/v1/me`) answer §1.1's
+      envelope, not a two-field `{error, message}` shape — only idp's OAuth
+      endpoints are exempt (§1.5).
 
 **keyServer specifically**
 
@@ -544,6 +554,11 @@ cover; it should be concrete enough to write from directly.
 - [ ] `AdminKeysError`'s three variants (`UnknownScope`, `InvalidGraceHours`,
       `AlreadyRevoked`) and the bare-500 `Db` variant all answer the §1.1
       envelope, not the current ad hoc `{"error": "..."}` shapes.
+- [ ] `APP_ENV=staging`/`uat` parses to a distinct `Staging` tier per §3.4 —
+      key-server's `AppEnv` was two-tier (`Development`/`Production`) and
+      rejected `staging` outright; this is a real gap, not a documented
+      exception (the original plan's M2 table omitted this repo from the
+      AppEnv fix by oversight).
 - [ ] Env is `ADMIN_IDP_BASE_URL`/`ADMIN_JWT_ISSUER`/`ADMIN_JWKS_URL`, not
       `IDP_*`; CORS env is `CORS_ALLOWED_ORIGINS`, not
       `ADMIN_CORS_ALLOWED_ORIGINS`.
