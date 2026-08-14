@@ -67,7 +67,7 @@ When a repo adds it, reuse the `error_code` catalog utility already built
 | 404 | `Not Found` | all |
 | 409 | `Conflict` | launcher (`key-server` uses its own ad-hoc 409 today — see §1.4) |
 | 422 | `Unprocessable Entity` | utility, news, key-server |
-| 429 | `Too Many Requests` (+ `Retry-After` header, seconds) | launcher |
+| 429 | `Too Many Requests` (+ `Retry-After` header, seconds) | launcher, keyServer, utility, web (see §3.6 for idp's OAuth-exception case and authServer's out-of-scope precedent) |
 | 503 | `Service Unavailable` | all (admin-guard outage, upstream dependency down) |
 | 500 | `Internal Server Error`, body always reads `"message": "Internal server error"` | all — internal detail goes to the log (`tracing::error!`), never the response |
 
@@ -561,6 +561,123 @@ row above for a gap: `web` (`maxgame-web-backend`), `mailer`
 is real but is NestJS's own framework convention, predates this rule, and
 is not being converged — the service is being retired (§1.5, §2.4).
 
+### 3.6 Rate limiting
+
+Not every endpoint needs a limiter — the fleet's rule of thumb is **look at
+the endpoint, not the repo**: if hammering it gets an attacker an account,
+free inventory, or a guessable secret, it needs one; if it only gets them
+public, cacheable data, it doesn't. `news` and `web`'s careers admin/public
+GETs have none, deliberately, on that basis. `mailer` has none for a
+different reason — a documented deviation, not an oversight:
+
+> `RATE_LIMIT_PER_MIN` is gone (deviation D2). Request throttling moved to
+> ingress-nginx.
+
+Source: `maxgame-mail-server/src/config.rs:14-15`.
+
+Where a limiter does exist today:
+
+| Service | Endpoint(s) | Key | Env (default) | State |
+|---|---|---|---|---|
+| `idp` | `POST /api/v1/oauth/google/start` | IP | `RATE_LIMIT_START_PER_MINUTE=20` | in-memory, per replica |
+| `idp` | `POST /api/v1/oauth/token` | IP | `RATE_LIMIT_TOKEN_PER_HOUR=60` | in-memory, per replica |
+| `keyServer` | `POST /v1/verify` | IP | `RATE_LIMIT_VERIFY_PER_MIN=120` | in-memory, per replica |
+| `utility` | `POST /v1/partner/presign-upload` | IP | `PARTNER_PRESIGN_PER_HOUR=15` (documented exception, §1.5-style — see rule 2) | in-memory, per replica |
+| `web` | `POST /admin/user-reports` (public submission) | IP (salted hash) | `USER_REPORTS_PER_HOUR=10` (documented exception, same as above) | **Postgres** (`rate_limit_counters`) — survives restarts, correct across replicas |
+| `launcher` | `POST /maxgame-launcher-coupons/redeem` | `player_id` | `RATE_LIMIT_COUPON_REDEEM_PER_MIN=10` | in-memory, per replica |
+| `authServer` *(out of scope — informative precedent only, see line 12)* | `POST /v1/auth/login`, `POST /v1/auth/{provider}/login-url`, `POST /v1/auth/refresh`, `POST /v1/launch/redemptions` | IP | `RATE_LIMIT_LOGIN_PER_MIN=10`, `RATE_LIMIT_LOGIN_URL_PER_MIN=30`, `RATE_LIMIT_REFRESH_PER_MIN=60`, `RATE_LIMIT_REDEMPTIONS_PER_MIN=10`, kill-switch `RATE_LIMIT_ENABLED=true` | **Redis** (fixed-window `INCR`+`EXPIRE`) — survives restarts, correct across replicas |
+
+Sources: `maxgame-admin-auth-server/src/config.rs:265-267`,
+`maxgame-key-server/src/config.rs:174`,
+`maxgame-utility-server/src/config.rs:242`,
+`maxgame-web-backend/src/config.rs:213-217` +
+`src/modules/user_reports/rate_limit.rs` +
+`migrations/20260814000003_rate_limit_counters.sql`,
+`maxgame-launcher-backend/src/modules/coupons/rate_limit.rs` +
+`.env.example:51`, `maxgame-auth-server/src/interface/middleware/rate_limit.rs`
++ `.env.example:38-42` + `src/infrastructure/adapters/rate_limit.rs`
+(`RedisRateLimiter`). `authServer`'s `POST /v1/auth/introspect` is
+deliberately **not** limited — game servers call it at a high, steady rate
+and it carries no secret to brute-force, so limiting it risks breaking games
+against a threat that doesn't apply to it
+(`maxgame-auth-server/src/interface/middleware/rate_limit.rs`'s module doc).
+
+Normative rules, extracted from the above rather than invented:
+
+1. **Every 429 carries `Retry-After` in seconds** — the remaining window,
+   rounded up, minimum 1. This was already §7's checklist line for "a 429
+   (where applicable)"; it is now a rule, not just a checklist item, because
+   `utility` shipped a 429 with no header at all before being caught (fixed
+   `167000e`, test `a_caller_over_the_hourly_limit_is_429` in
+   `tests/partner_presign.rs`). §1.2's 429 row records which services this
+   applies to today: `launcher`, `keyServer`, `utility`, `web` answer it
+   through the shared flat envelope (§1.1); `idp`'s two OAuth limits answer
+   it through the RFC 6749 exception envelope instead (§1.5) — same header,
+   different body shape, because the OAuth routes were already exempt from
+   §1.1 before rate limiting existed. `authServer` is out of contract scope
+   (line 12) and is not counted in either.
+2. **Env naming: `RATE_LIMIT_<WHAT>_PER_MIN` / `_PER_HOUR`.** Two pre-existing
+   names are documented exceptions rather than forced renames, in the same
+   spirit as §1.5/§2.4: `PARTNER_PRESIGN_PER_HOUR` (utility) and
+   `USER_REPORTS_PER_HOUR` (web) predate this convention and are load-bearing
+   in deployed `.env` files. `idp`'s two names are a **third**, previously
+   unrecorded exception in the same family: `RATE_LIMIT_START_PER_MINUTE` and
+   `RATE_LIMIT_TOKEN_PER_HOUR` spell the minute unit out in full
+   (`_PER_MINUTE`, not `_PER_MIN`) where every other service abbreviates it.
+   Noted here rather than renamed, for the same reason as the other two.
+3. **The trust-proxy flag is named `TRUST_PROXY_HEADERS`, default `false`.**
+   It gates whether a proxy header (`X-Forwarded-For`, `X-Real-IP`, or
+   `CF-Connecting-IP`, depending on the service — rule 4) is read at all for
+   both rate-limit keying and audit-log IP capture; with it off, only the TCP
+   peer address is trusted. `idp` shipped this as `TRUST_FORWARDED_HEADERS`
+   until M2/M3 convergence; the M2 rename (`1261e72`) brought it in line with
+   `keyServer` and `utility`, which already used `TRUST_PROXY_HEADERS`.
+   `grep -rn TRUST_FORWARDED_HEADERS` across the fleet today returns nothing
+   outside git history.
+4. **Client-IP resolution order is not yet converged fleet-wide — two
+   patterns exist, and only one is recommended for new code.** `keyServer`,
+   `utility`, and `web` resolve `CF-Connecting-IP` → left-most
+   `X-Forwarded-For` hop → TCP peer, gated entirely behind
+   `TRUST_PROXY_HEADERS` (`maxgame-web-backend/src/modules/user_reports/rate_limit.rs:42-53`,
+   test `cloudflares_header_outranks_the_forwarded_chain`, is the reference
+   implementation — Cloudflare overwrites its own header at the edge so a
+   client cannot forge it, which is why it outranks the client-suppliable
+   XFF). `idp` and `authServer` instead resolve left-most `X-Forwarded-For` →
+   `X-Real-IP` → TCP peer, with no `CF-Connecting-IP` step at all
+   (`maxgame-admin-auth-server/src/inbound/extract.rs`,
+   `maxgame-auth-server/src/interface/middleware/rate_limit.rs` — the latter's
+   own doc comment says it mirrors idp's "byte for byte"). Both patterns
+   share the load-bearing property this rule actually requires: **a service
+   must never trust a proxy header unconditionally** — every implementation
+   above gates the header(s) behind `TRUST_PROXY_HEADERS` and falls back to
+   the TCP peer with it off. Converging the two patterns onto one order is
+   left as a follow-up, not required by this contract; a new limiter should
+   default to `web`'s `CF-Connecting-IP`-first order unless it has a specific
+   reason not to.
+5. **State honesty.** In-memory windows (`idp`, `keyServer`, `utility`,
+   `launcher`) are per replica — the effective limit is the configured value
+   × replica count — and are lost on restart. This is accepted by design for
+   anti-abuse limits, not an oversight (see each service's own module doc,
+   e.g. `maxgame-launcher-backend/src/modules/coupons/rate_limit.rs`'s
+   "accepted on purpose, because this is anti-abuse rather than an account
+   quota"). `web` (Postgres) and `authServer` (Redis) are the fleet's two
+   examples of a limiter that survives restarts and is correct across
+   replicas — reach for one of those two patterns, not a new one, when a
+   future limiter needs to scale out. Separately: **prefer keying by
+   identity over IP wherever an authenticated identity already exists.**
+   `launcher`'s coupon-redeem limiter keys by `player_id`, not IP, precisely
+   because the route sits behind player auth and an IP-keyed limiter would
+   both be weaker (NAT/shared-IP false sharing) and unnecessary (the real
+   identity is already known) — the fleet's one example of identity-keyed
+   limiting today.
+6. **A rate-limit value that fails to parse refuses to boot** — never a
+   silent fallback to the default. This matches the fleet's general config
+   convention (§3.4) rather than inventing a rate-limit-specific rule; e.g.
+   `maxgame-key-server/src/config.rs:708-713` and
+   `maxgame-launcher-backend/src/config.rs:1195-1209` both test a
+   non-numeric value for their respective rate-limit env vars and assert the
+   boot fails naming that variable.
+
 ---
 
 ## 4. Admin authentication
@@ -880,6 +997,12 @@ cover; it should be concrete enough to write from directly.
 - [ ] idp's own non-OAuth admin routes (e.g. `/api/v1/me`) answer §1.1's
       envelope, not a two-field `{error, message}` shape — only idp's OAuth
       endpoints are exempt (§1.5).
+- [ ] `POST /api/v1/oauth/google/start` and `POST /api/v1/oauth/token` each
+      429 once their respective window (`RATE_LIMIT_START_PER_MINUTE`,
+      `RATE_LIMIT_TOKEN_PER_HOUR`) is exhausted, carrying `Retry-After`, in
+      the RFC 6749 exception envelope (§1.5), not §1.1's (§3.6 rule 1).
+- [ ] `grep -rn TRUST_FORWARDED_HEADERS` returns nothing outside git history
+      — renamed to `TRUST_PROXY_HEADERS` (§3.6 rule 3, `1261e72`).
 
 **keyServer specifically**
 
@@ -917,6 +1040,11 @@ cover; it should be concrete enough to write from directly.
       user-reports admin list intentionally keeps cursor/`limit` (§2.4
       exception) — a test should assert this divergence is *intentional*
       (i.e. exists and matches the documented shape) rather than accidental.
+- [ ] The public user-reports submission 429s past `USER_REPORTS_PER_HOUR`
+      (default 10), keyed by a salted IP hash (`RATE_LIMIT_IP_SALT`, required
+      at boot) resolved `CF-Connecting-IP` → left-most XFF → peer, with
+      `Retry-After` set and the counter surviving a restart — it lives in
+      Postgres (`rate_limit_counters`), not memory (§3.6 rules 1, 4, 5).
 
 **utility specifically**
 
@@ -929,6 +1057,10 @@ cover; it should be concrete enough to write from directly.
 - [ ] The in-code ADR comment in `src/infrastructure/admin_auth.rs` matches
       whatever the actual current behaviour is (no code/comment
       contradiction) — re-check this specifically after M3 lands.
+- [ ] A 429 past `PARTNER_PRESIGN_PER_HOUR` carries `Retry-After` (§3.6 rule
+      1 — this was missing until `167000e`; test
+      `a_caller_over_the_hourly_limit_is_429` in `tests/partner_presign.rs`
+      pins it so it cannot regress silently again).
 
 **launcher specifically**
 
@@ -936,6 +1068,12 @@ cover; it should be concrete enough to write from directly.
 - [ ] `docker build` succeeds (currently broken — the Dockerfile does not
       `COPY` the path-dependency `maxgame-admin-guard/rust`; see `news`'s
       Dockerfile for the working pattern to copy).
+- [ ] `POST /maxgame-launcher-coupons/redeem` 429s past
+      `RATE_LIMIT_COUPON_REDEEM_PER_MIN` (default 10), keyed by `player_id`
+      rather than IP (§3.6 rule 5), and the check runs before the code lookup
+      so a valid and an invalid code are throttled identically — limiting
+      only failed attempts would leak which codes are valid through 429
+      timing (`src/modules/coupons/rate_limit.rs`, `c8bb9c8`).
 
 **mailer specifically**
 
