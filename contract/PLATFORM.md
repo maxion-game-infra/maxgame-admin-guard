@@ -92,6 +92,8 @@ retry later); a 500's `message` never is. Source: launcher
 
 Source: `maxgame-utility-server/src/inbound/error.rs` (`DomainError::error_code`) for the first eight. `CONFLICT` was added by `maxgame-key-server` (`src/error.rs`, `src/routes/admin_keys.rs` — its one 409 case, "key is already revoked") during M2, since the original eight had no 409 entry; sanctioned as a contract amendment rather than a repo-local invention, so the next repo with a 409 reuses it instead of picking its own string.
 
+**Ruling on vocabulary — a repo may keep its own `code` values.** idp's `code` field carries its pre-existing `DomainError` codes verbatim (`unauthorized`, `not_found`, `forbidden`, …, lowercase snake_case) rather than remapping onto this table's SCREAMING_CASE strings (`src/inbound/error.rs`, fixed in `f45b634` alongside the rest of §1.1). This is allowed: the requirement is that `code` be *stable and machine-readable within a service*, not that every service share one vocabulary — a client already scopes its branching by which service answered, so two services never need to compare `code` values against each other directly. §1.3's table remains the *recommended* starting vocabulary for a service with no existing one of its own (i.e. new services via the M6 template), not a mandate to remap an established one.
+
 ### 1.4 Non-conformance found and fixed during M2/M3
 
 These were identified while writing this document (M1) or during M2 implementation, and closed as part of the convergence work rather than left open:
