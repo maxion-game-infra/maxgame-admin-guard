@@ -461,7 +461,7 @@ silently produced a broken URL with no path separator at all — not an
 error, just a URL that resolves nowhere real. Fixed by joining the two
 pieces through a helper that tolerates the missing slash.
 
-Reference implementation: `maxion-admin-guard/template/src/config.rs`'s
+Reference implementation: `maxgame-admin-guard/template/src/config.rs`'s
 `validate()` (the resolved-value checks) and `join_url` (the leading-slash
 tolerance, and its doc comment for the no-passthrough guarantee), plus the
 tests `an_explicit_https_jwks_url_does_not_excuse_a_plaintext_base_url`,
@@ -934,7 +934,7 @@ cover; it should be concrete enough to write from directly.
 
 - [ ] `AppEnv` has three tiers and the guardrail test described above.
 - [ ] `docker build` succeeds (currently broken — the Dockerfile does not
-      `COPY` the path-dependency `maxion-admin-guard/rust`; see `news`'s
+      `COPY` the path-dependency `maxgame-admin-guard/rust`; see `news`'s
       Dockerfile for the working pattern to copy).
 
 **mailer specifically**

@@ -2,7 +2,7 @@
 #
 # BuildKit reads `<dockerfile>.dockerignore` in preference to the context
 # root's `.dockerignore` — which matters here, because the context is
-# `maxion-admin-guard/` (see the Dockerfile header), which also holds `js/`,
+# `maxgame-admin-guard/` (see the Dockerfile header), which also holds `js/`,
 # `contract/`, and this same `template/` tree's own `target/`. Without this,
 # `docker build` would upload all of it.
 #

@@ -10,25 +10,25 @@
 #   docker build -f Dockerfile -t maxgame-template-server ..
 #
 # `maxion-admin-guard` is a **path dependency** (`../rust` in Cargo.toml,
-# from inside `maxion-admin-guard/`) because no service repo has a git
+# from inside `maxgame-admin-guard/`) because no service repo has a git
 # remote yet. Cargo resolves that path before it compiles anything, so a
 # build whose context is this directory alone fails at `cargo build` with
 # "failed to load manifest for dependency" no matter what the Dockerfile
 # does — the file is simply not in the context. Hence the parent.
 #
 # ⚠️ WHEN YOU COPY THIS TEMPLATE OUT to become a real service repo
-# (`maxgame-foo-server/`, a sibling of `maxion-admin-guard/`), the COPY
+# (`maxgame-foo-server/`, a sibling of `maxgame-admin-guard/`), the COPY
 # paths below and Cargo.toml's path-dep both need their leading
-# `template/` replaced with `maxion-admin-guard/` — see the warning at the
+# `template/` replaced with `maxgame-admin-guard/` — see the warning at the
 # top of `Cargo.toml`. The build context command above also changes to
 # `docker build -f Dockerfile -t maxgame-foo-server ../..` (one more level
-# up) since the new repo is no longer nested inside `maxion-admin-guard/`.
+# up) since the new repo is no longer nested inside `maxgame-admin-guard/`.
 #
 # ── BUILDKIT IS REQUIRED, AND NOT ONLY FOR THE CACHE MOUNTS ───────────
 #
 # `<dockerfile>.dockerignore` is a BuildKit feature. The legacy builder
 # reads only `<context>/.dockerignore`, and the context here is
-# `maxion-admin-guard/`, which has none — a legacy build would try to
+# `maxgame-admin-guard/`, which has none — a legacy build would try to
 # upload the whole crate (including every OTHER repo's build artifacts, if
 # run from a shared parent) before failing on the `RUN --mount` below.
 # BuildKit is the default from Docker 23 and matches the pattern

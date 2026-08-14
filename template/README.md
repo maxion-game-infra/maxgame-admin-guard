@@ -34,11 +34,11 @@ service needs:
 ## Copying this out to become a real service
 
 1. `cp -r template ../maxgame-<name>-server && cd ../maxgame-<name>-server`
-   — it is now a **sibling** of `maxion-admin-guard/`, not a child of it.
+   — it is now a **sibling** of `maxgame-admin-guard/`, not a child of it.
 2. **Fix the path dependency**: `Cargo.toml`'s `maxion-admin-guard = { path
-   = "../rust" }` becomes `{ path = "../maxion-admin-guard/rust" }` — see
+   = "../rust" }` becomes `{ path = "../maxgame-admin-guard/rust" }` — see
    the warning comment right above that line. Same fix in `Dockerfile`'s
-   `COPY rust ./rust` (→ `COPY maxion-admin-guard/rust ./maxion-admin-guard/rust`)
+   `COPY rust ./rust` (→ `COPY maxgame-admin-guard/rust ./maxgame-admin-guard/rust`)
    and its build command (context becomes `../..`, one more level up).
 3. Rename the crate: `Cargo.toml`'s `[package] name`, `[lib] name`,
    `[[bin]] name`, and every `template_server`/`maxgame-template-server`
