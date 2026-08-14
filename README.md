@@ -1,4 +1,6 @@
-# maxion-admin-guard
+# maxgame-admin-guard
+
+> The Rust crate inside `rust/` is still named `maxion-admin-guard` — consumers depend on it by that name; only the repository/directory was renamed.
 
 One definition of admin request authorization, and two implementations of it
 that are held to that definition by a shared test suite.

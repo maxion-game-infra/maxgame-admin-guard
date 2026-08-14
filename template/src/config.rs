@@ -4,7 +4,7 @@
 //! directly, so what is required, what defaults, and what a deployed
 //! environment refuses are all testable without mutating process-global
 //! state. This is the platform's standard shape
-//! (`maxion-admin-guard/contract/PLATFORM.md` §3) — copy it into a new
+//! (`maxgame-admin-guard/contract/PLATFORM.md` §3) — copy it into a new
 //! service unchanged except for `PORT`'s default and anything domain-specific
 //! you add.
 

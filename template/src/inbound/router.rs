@@ -18,7 +18,7 @@ pub fn build_router(state: AppState) -> Router {
     let cors = cors_layer(&state.config);
 
     // Admin routes are gated by the shared `AdminGuard` — the eight rules in
-    // `maxion-admin-guard/contract/README.md`, run the same way every other
+    // `maxgame-admin-guard/contract/README.md`, run the same way every other
     // admin-facing service on the platform runs them. `route_layer` runs the
     // *last* layer added first; there's only one layer here because
     // `require_admin` already does the whole contract (offline verify, live

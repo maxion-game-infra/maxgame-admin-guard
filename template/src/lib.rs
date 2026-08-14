@@ -4,7 +4,7 @@
 //! them. Everything else (config, error envelope, health, `BASE_PATH`, CORS,
 //! admin-guard wiring) is meant to survive unchanged.
 //!
-//! See `README.md` for what to rename and `maxion-admin-guard/contract/PLATFORM.md`
+//! See `README.md` for what to rename and `maxgame-admin-guard/contract/PLATFORM.md`
 //! for why each piece is shaped the way it is.
 
 pub mod adapters;

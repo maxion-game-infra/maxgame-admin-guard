@@ -24,7 +24,7 @@ path = "src/main.rs"
 # so from here the crate is `../rust`. A new service copied out to become a
 # sibling repo (`maxgame-foo-server/`, next to `maxgame-admin-guard/` the way
 # every other backend on the platform is) needs `../maxgame-admin-guard/rust`
-# instead — one more `../maxion-admin-guard` segment. Forgetting this is a
+# instead — one more `../maxgame-admin-guard` segment. Forgetting this is a
 # `cargo build` error naming this exact line, not a silent bug: no change is
 # invisible.
 maxion-admin-guard = { path = "../rust" }

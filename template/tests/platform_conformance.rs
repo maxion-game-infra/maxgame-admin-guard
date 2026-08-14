@@ -2,7 +2,7 @@
 //! checklist ("Every Rust repo"). This is the M6 reference template — every
 //! item here should still pass after you copy this crate out and rename it;
 //! if one stops passing, you changed something the contract requires.
-//! Checklist source: `maxion-admin-guard/contract/PLATFORM.md` §7.
+//! Checklist source: `maxgame-admin-guard/contract/PLATFORM.md` §7.
 //!
 //! ## Crosswalk
 //!
