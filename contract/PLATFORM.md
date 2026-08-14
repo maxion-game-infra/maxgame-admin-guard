@@ -113,6 +113,30 @@ These were identified while writing this document (M1) or during M2 implementati
   nested shape — different contract, different repo pair, out of scope here.
 - **NestJS `api`** keeps whatever it already emits (it *is* the origin of
   §1.1's shape) — it's being retired, not migrated.
+- **`mailer` (`maxgame-mail-server`) splits by surface.** Its **admin**
+  routes (`/v1/admin/*`) conform to §1.1 in full. Its **team** routes
+  (`POST /v1/emails:send`, `GET /v1/jobs/{id}`) keep the nested
+  `{"error": {"code", "message"}}` envelope inherited from
+  `maxgame-email-server-legacy`, because `web-cs-backend`
+  (`src/adapters/notification/relay_email_service.rs`) and `mu-alpha-pipeline`
+  (`src/lib/email-api.js`) parse that shape against the live relay today, and
+  the port's premise is that team API keys and their callers survive cutover
+  untouched. The split is deliberate and was decided with the evidence in
+  front of it: the admin surface is already breaking-changed by the move to
+  `maxion-admin-guard`, so it has no legacy client to protect, and leaving it
+  nested would have reproduced the exact §1.4 utility bug — the back office's
+  `messageFrom()` (`web-platform-back-office/src/lib/axios.ts:163`) reads only
+  a top-level `message`, and the NestJS proxy rethrows the mailer's body
+  verbatim, so every Mail Service admin error rendered as "Something went
+  wrong!". `code` is identical across both surfaces, and so is `message` with
+  exactly one exception: a 500 reads this document's fleet-wide
+  `"Internal server error"` on the admin surface and Node's
+  `"Internal Server Error"` on the team surface. Per the §1.3 vocabulary
+  ruling, `code` keeps the service's own inherited values
+  (`domain_not_found`, `sender_inactive`, `key_revoked`, …) rather than
+  remapping onto the SCREAMING_CASE table. Both invariants are pinned by
+  tests (`the_two_surfaces_agree_on_code_and_message` and
+  `the_500_message_is_the_only_wording_that_differs_between_surfaces`).
 
 ---
 
@@ -167,6 +191,25 @@ deployed, so this is free to change.
 
 ### 2.4 Documented exceptions
 
+- **`mailer` (`maxgame-mail-server`)** keeps the Node relay's query and
+  envelope on every admin list, rather than §2.1's `page`/`take` +
+  `{items, meta}`:
+
+  ```json
+  // GET /v1/admin/domains?page=2&pageSize=20
+  { "page": 2, "pageSize": 20, "total": 13, "totalPages": 1, "items": [] }
+  ```
+
+  Source: ported from `maxgame-email-server-legacy/src/lib/pagination.js`. The five
+  `sa-maxgame-email-*` back-office sections and the NestJS proxy DTOs already
+  consume this shape, so converging would be a SPA rework rather than a wire
+  fix — the same reasoning that exempts `web`'s user-reports below. It also
+  keeps the Node service's `parseInt` semantics deliberately: `?page=1.7` is
+  page 1, `?page=abc` falls back to the default rather than erroring, and a
+  `pageSize` above 200 clamps silently instead of 400ing. Only a parsed value
+  below 1 is a 400. Those are bug-for-bug parity with the live relay, pinned
+  by tests.
+
 - **`authServer` (FROZEN — deployed to prod):**
 
   ```json
@@ -212,6 +255,7 @@ deployed, so this is free to change.
 | `news` | 8093 | `/healthz` | `/readyz` (**waits on a background migration** — see below) | `maxgame-news-backend` |
 | `web` | 8094 | `/healthz` | `/readyz` | `maxgame-web-backend` |
 | `utility` | 8095 | `/healthz` | `/readyz` | `maxgame-utility-server` |
+| `mailer` | 8096 | `/healthz` | `/readyz` | `maxgame-mail-server` (also serves the legacy `/health` at root, because the Node relay's clients and its runbooks use that path — additive, not a replacement) |
 | `api` | 8080 | `/health` (legacy name, not `/healthz` — not converging, being retired) | — | `web-platform-backend` |
 | SPA | 5173 | `/` | — | `web-platform-back-office` |
 
@@ -247,6 +291,7 @@ validates it; empty is refused outside development too).
 | `news` | `ADMIN_CORS_ALLOWED_ORIGINS` | ❌ M2: rename to `CORS_ALLOWED_ORIGINS` |
 | `web` | `CORS_ORIGIN` | ❌ M2: rename to `CORS_ALLOWED_ORIGINS` |
 | `utility` | `CORS_ALLOWED_ORIGINS` | ✅ already standard |
+| `mailer` | `CORS_ALLOWED_ORIGINS` | ✅ standard — shipped as `CORS_ORIGIN` (copied from `web`'s spelling), caught by its own `tests/platform_conformance.rs` before deployment and renamed in `4d6842f`. Its conformance test asserts the standard name boots **and** that the pre-rename name no longer does, so the service cannot quietly accept both |
 | `authServer` | (its own admin-subtree origin config) | **exception**: a dual-surface service (player API + admin proxy) may additionally use `ADMIN_CORS_ALLOWED_ORIGINS` for the admin subtree — this is the one legitimate use of that name on the whole platform |
 
 Source: `grep -n allow_headers\|CORS_ORIGIN\|ADMIN_CORS_ALLOWED_ORIGINS` across
@@ -330,14 +375,14 @@ what stays correct even if a future change to how a URL is built forgets to
 preserve the scheme, instead of relying on every call site to remember the
 invariant.
 
-**That last point is not hypothetical — it is already true of five of the
-six Rust repos.** `idp`, `keyServer`, `launcher`, `news`, `web`, and
-`utility` each have their own `absolute_url(base, path)` helper: when
+**That last point is not hypothetical — it is already true of six of the
+seven Rust repos.** `keyServer`, `launcher`, `news`, `web`, `utility`, and
+`mailer` each have their own `absolute_url(base, path)` helper: when
 `ADMIN_INTROSPECT_PATH` itself starts with `http://` or `https://`, that
 value is used *as-is* instead of being joined onto `ADMIN_IDP_BASE_URL` —
-`maxgame-utility-server/.env.example` documents
+`maxgame-utility-server/src/config.rs:561` pins
 `ADMIN_INTROSPECT_PATH=https://other-host.example/introspect` as an
-accepted, deliberate config shape, not an edge case. So in those five
+accepted, deliberate config shape, not an edge case. So in those six
 repos, `introspect_url`'s scheme does **not** only come from
 `ADMIN_IDP_BASE_URL`; it can come from the override instead. The
 resolved-value check is what makes that safe: it does not matter whether
@@ -347,7 +392,7 @@ either way. **This is exactly why the check must stay on the resolved URL,
 and must never be "simplified" back to checking `ADMIN_IDP_BASE_URL`
 alone** — that would silently stop covering the passthrough path. A
 consequence worth being explicit about: pointing introspection at a
-*different* https host is possible in these five repos via an env var.
+*different* https host is possible in these six repos via an env var.
 That requires env write access on the deployment (not, by itself, a
 vulnerability an outside caller can trigger), but this document should not
 claim it is impossible.
@@ -355,10 +400,10 @@ claim it is impossible.
 **The template is the deliberate exception.** It has no
 `ADMIN_INTROSPECT_PATH` absolute-URL passthrough at all — `join_url` always
 joins the path onto the base, never substitutes for it (see its doc
-comment) — so a new service starts stricter than the five existing repos
+comment) — so a new service starts stricter than the six existing repos
 rather than inheriting their more permissive shape. If a future change to
 the template *does* add a passthrough, the resolved-value check keeps it
-safe the same way it already does for the five repos that have one; the
+safe the same way it already does for the six repos that have one; the
 check does not depend on the passthrough's absence to be correct.
 
 A related bug in the same code path: `ADMIN_INTROSPECT_PATH` used to
@@ -462,7 +507,7 @@ nests its whole router under it (axum `Router::nest(base_path, app)`).
 | `/web` | `web` | `maxgame-web-backend` |
 | `/utility` | `utility` | `maxgame-utility-server` |
 | `/platform` | `api` | `web-platform-backend` (temporary — strip-prefix at the ingress instead of a code change, since this service is being retired) |
-| (not on the gateway) | — | `maxgame-email-server` (stays on Cloud Run, `mailer.*`) |
+| `/mailer` | `mailer` | `maxgame-mail-server` (the Rust port of `maxgame-email-server-legacy`; port 8096, `BASE_PATH=/mailer`, no ingress rewrite. Replaces the old "stays on Cloud Run" row — the Node service on `mailer.*` is retired at cutover. See its exceptions in §1.5 and §2.4) |
 
 ### 5.2 `BASE_PATH` contract
 
@@ -569,7 +614,7 @@ the live, enforced list (`is_known_scope`).
 | `LAUNCHER_COUPONS_PIPELINE_SECRET` | `x-pipeline-secret` | launcher (mu-alpha-pipeline coupon routes) | `platform:coupon-pipeline` |
 | `DOWNLOAD_APP_KEYS` (JSON map) | `X-Download-App-Key` | launcher (download-token minting) | not yet scoped — per-app, not per-service |
 | `ADMIN_API_KEYS` (env) / DB-backed key | `X-Admin-Key` | `maxgame-auth-server` (dual-accept alongside admin JWT — `X-Admin-Key` wins if present; see `src/interface/middleware/admin.rs:1-21`) | `authserver:games:read` already exists in the catalog (§6.3) as the landing spot |
-| (env-configured admin key) | `x-admin-key` | `maxgame-email-server` | not yet scoped |
+| ~~(env-configured admin key)~~ | ~~`x-admin-key`~~ | ~~`maxgame-email-server-legacy`~~ | **RETIRED** — `maxgame-mail-server` replaced it with `maxion-admin-guard` (super_admin only) on the admin surface. Its team surface still uses per-tenant `mxk_live_…` bearer keys, which are tenant credentials, not an S2S service key, so they do not belong in this table |
 
 None of these are touched by this plan (plan §7 follow-up item 4). They are
 recorded so a future migration doesn't have to rediscover them.
@@ -582,7 +627,7 @@ Each repo below writes and owns its own test for these — no shared test
 harness, per D0. This is the checklist a repo's conformance test (M5) must
 cover; it should be concrete enough to write from directly.
 
-**Every Rust repo (6): idp, keyServer, launcher, news, web, utility**
+**Every Rust repo (7): idp, keyServer, launcher, news, web, utility, mailer**
 
 - [ ] Every error response is `{statusCode, message, error}` (§1.1); a 500's
       `message` is always exactly `"Internal server error"`; a 429 (where
@@ -612,13 +657,13 @@ cover; it should be concrete enough to write from directly.
       `ADMIN_IDP_BASE_URL` alone as a proxy for it** — in the template,
       `introspect_url` always inherits the base URL's scheme (no
       `ADMIN_INTROSPECT_PATH` absolute-URL passthrough exists there — see
-      `join_url`'s doc comment), but idp/keyServer/launcher/news/web/utility
+      `join_url`'s doc comment), but keyServer/launcher/news/web/utility/mailer
       each have their own `absolute_url(base, path)` passthrough, where an
       `ADMIN_INTROSPECT_PATH` starting with `http://`/`https://` is used
       as-is instead of being joined onto the base (`maxgame-utility-server
-      /.env.example` documents this as an accepted config shape, not an
+      /src/config.rs:561` documents this as an accepted config shape, not an
       edge case). A base_url-only check would silently stop covering that
-      passthrough path in those five repos; a resolved-value check catches
+      passthrough path in those six repos; a resolved-value check catches
       a plaintext result regardless of which input produced it. See §3.3,
       `template/src/config.rs`'s `validate()` for the reference resolved-value
       checks, and its
