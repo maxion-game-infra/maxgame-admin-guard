@@ -328,10 +328,38 @@ the two *resolved* struct fields (`admin_idp.jwks_url`,
 `ADMIN_IDP_BASE_URL` as a proxy for them — checking the resolved value is
 what stays correct even if a future change to how a URL is built forgets to
 preserve the scheme, instead of relying on every call site to remember the
-invariant. There is no `ADMIN_INTROSPECT_PATH` absolute-URL passthrough (a
-path is always joined onto the base, never used in place of it), so today
-`introspect_url`'s scheme can only come from `ADMIN_IDP_BASE_URL` — but the
-check does not depend on that staying true.
+invariant.
+
+**That last point is not hypothetical — it is already true of five of the
+six Rust repos.** `idp`, `keyServer`, `launcher`, `news`, `web`, and
+`utility` each have their own `absolute_url(base, path)` helper: when
+`ADMIN_INTROSPECT_PATH` itself starts with `http://` or `https://`, that
+value is used *as-is* instead of being joined onto `ADMIN_IDP_BASE_URL` —
+`maxgame-utility-server/.env.example` documents
+`ADMIN_INTROSPECT_PATH=https://other-host.example/introspect` as an
+accepted, deliberate config shape, not an edge case. So in those five
+repos, `introspect_url`'s scheme does **not** only come from
+`ADMIN_IDP_BASE_URL`; it can come from the override instead. The
+resolved-value check is what makes that safe: it does not matter whether
+`introspect_url` got its scheme from the base URL or from an absolute
+override, checking the final resolved string catches a plaintext result
+either way. **This is exactly why the check must stay on the resolved URL,
+and must never be "simplified" back to checking `ADMIN_IDP_BASE_URL`
+alone** — that would silently stop covering the passthrough path. A
+consequence worth being explicit about: pointing introspection at a
+*different* https host is possible in these five repos via an env var.
+That requires env write access on the deployment (not, by itself, a
+vulnerability an outside caller can trigger), but this document should not
+claim it is impossible.
+
+**The template is the deliberate exception.** It has no
+`ADMIN_INTROSPECT_PATH` absolute-URL passthrough at all — `join_url` always
+joins the path onto the base, never substitutes for it (see its doc
+comment) — so a new service starts stricter than the five existing repos
+rather than inheriting their more permissive shape. If a future change to
+the template *does* add a passthrough, the resolved-value check keeps it
+safe the same way it already does for the five repos that have one; the
+check does not depend on the passthrough's absence to be correct.
 
 A related bug in the same code path: `ADMIN_INTROSPECT_PATH` used to
 concatenate straight onto the base URL (`{base}{path}`), so a value missing
@@ -580,19 +608,24 @@ cover; it should be concrete enough to write from directly.
       `ADMIN_JWKS_URL`/`ADMIN_INTROSPECT_PATH` input env vars — must be
       `https://`, checked **independently** at the resolved value: an https
       `ADMIN_JWKS_URL` override must not excuse a plaintext
-      `ADMIN_IDP_BASE_URL`, because `introspect_url` still inherits the
-      base URL's scheme (there is no `ADMIN_INTROSPECT_PATH` absolute-URL
-      passthrough — a path is always joined onto the base, never used in
-      place of it). Checking the resolved values rather than only
-      `ADMIN_IDP_BASE_URL` is what keeps this correct even if a future
-      change to how a URL is built forgets to preserve the scheme, instead
-      of relying on every call site to remember the invariant. See §3.3 and
-      `template/src/config.rs`'s `validate()` for the reference pair of
-      checks, `join_url`'s doc comment for the no-passthrough guarantee,
-      and `template/src/config.rs`'s
+      `ADMIN_IDP_BASE_URL`. **Check the resolved string, never
+      `ADMIN_IDP_BASE_URL` alone as a proxy for it** — in the template,
+      `introspect_url` always inherits the base URL's scheme (no
+      `ADMIN_INTROSPECT_PATH` absolute-URL passthrough exists there — see
+      `join_url`'s doc comment), but idp/keyServer/launcher/news/web/utility
+      each have their own `absolute_url(base, path)` passthrough, where an
+      `ADMIN_INTROSPECT_PATH` starting with `http://`/`https://` is used
+      as-is instead of being joined onto the base (`maxgame-utility-server
+      /.env.example` documents this as an accepted config shape, not an
+      edge case). A base_url-only check would silently stop covering that
+      passthrough path in those five repos; a resolved-value check catches
+      a plaintext result regardless of which input produced it. See §3.3,
+      `template/src/config.rs`'s `validate()` for the reference resolved-value
+      checks, and its
       `an_explicit_https_jwks_url_does_not_excuse_a_plaintext_base_url` and
-      `admin_introspect_path_is_never_an_absolute_url_override` tests for
-      the independence and no-passthrough proofs.
+      `admin_introspect_path_is_never_an_absolute_url_override` tests (the
+      latter proving the template's own, stricter no-passthrough design,
+      not a platform-wide guarantee).
 - [ ] `ADMIN_INTROSPECT_PATH` tolerates a value missing its leading slash
       (`admin/introspect` as well as the correct `/admin/introspect`)
       rather than silently concatenating into a broken URL with no path
