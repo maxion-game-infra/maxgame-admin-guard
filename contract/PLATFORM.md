@@ -316,6 +316,21 @@ template; sweep for it in M2 rather than assuming it is already gone.
 both default `PORT` to `8090` — that's `keyServer`'s port (§3.1 says `idp` is
 8091). M2: change the default to 8091 in both places.
 
+**Both `ADMIN_IDP_BASE_URL` and `ADMIN_JWKS_URL` must be https outside
+development.** `ADMIN_JWKS_URL` being https was already a rule (§3.4's
+guardrail list); `ADMIN_IDP_BASE_URL` itself was not separately checked,
+which left a gap: `ADMIN_INTROSPECT_PATH` defaults to a path *relative to
+`ADMIN_IDP_BASE_URL`*, so a plaintext base URL is a token-forgery path on
+the introspection call even when `ADMIN_JWKS_URL` is explicitly overridden
+to something safe. Both checks are independent and both required — one
+does not excuse the other. Reference implementation:
+`maxion-admin-guard/template/src/config.rs`'s `validate()`, which checks
+`admin_idp.base_url` immediately before the existing `admin_idp.jwks_url`
+check, plus the test
+`an_explicit_https_jwks_url_does_not_excuse_a_plaintext_base_url` proving
+the two are independent. Every repo with this env set should carry the
+same pair of checks.
+
 ### 3.4 `AppEnv`: three tiers, guardrails keyed off `!is_dev()`
 
 ```rust
@@ -338,13 +353,25 @@ is deliberately **not** accepted (it reads as a deployed QA environment at
 least as often as a laptop, and guessing wrong would hand an internet-facing
 box the relaxed rules).
 
-`idp` (`maxgame-admin-auth-server/src/config.rs:22-44`) currently has only
-**two** tiers (`Development`, `Production`), defaulting unset `APP_ENV` to
-`Development` — so **staging currently gets dev's relaxed rules there**. M2:
-adopt utility's three-tier model, `APP_ENV` becomes required (no default).
-`launcher`/`news`/`web` need the same audit — confirm each already matches
-utility's model before M2 closes; `news` and `web` were not checked line by
-line for this while writing this document, only for their CORS/IdP env names.
+`idp` (`maxgame-admin-auth-server/src/config.rs`) has since adopted the
+three-tier model above (fixed `0f04ddd`) — `APP_ENV` is now required, no
+default, and `staging`/`uat` parse to `AppEnv::Staging` exactly as they do
+in `utility`. `launcher`, `news`, `web`, and `utility` already matched the
+three-tier model; `key-server` did not and was fixed separately (see its
+own conformance test).
+
+**Ops note — idp no longer accepts `APP_ENV=test`.** Before the fix above,
+idp's two-tier parser mapped an unset or unrecognized `APP_ENV` (including
+literally `test`) to `Development`, so a deployment that set `APP_ENV=test`
+got the relaxed dev guardrails. Post-fix, idp follows the same parser every
+other repo uses: `test` is rejected outright (refuses to boot) rather than
+silently mapped to anything. If any deployment manifest, CI job, or
+`.env.example` still sets `APP_ENV=test` for idp, it will now fail to boot
+— change it to `development`/`dev`/`local` (for a real dev box) or
+`staging`/`uat` (for a QA deployment that should get deployed-tier
+guardrails), per the reasoning above: `test` is deliberately not a
+recognized spelling anywhere on the platform, because it reads as a
+deployed QA environment at least as often as a laptop.
 
 ---
 
@@ -524,11 +551,22 @@ cover; it should be concrete enough to write from directly.
       `x-api-key`); a literal `*` in `CORS_ALLOWED_ORIGINS` refuses to boot;
       an empty allowlist refuses to boot outside `Development`.
 - [ ] `APP_ENV` is required (no silent default to `Development`); `staging`
-      and `uat` both parse to `AppEnv::Staging`, not `Development`; every
-      deployment guardrail (Swagger off, HTTPS JWKS, non-empty CORS
-      allowlist, etc.) fires identically for `staging` and `production` —
-      i.e. is keyed off `!is_dev()`, verified by a test that runs the same
-      guardrail assertions against both tiers.
+      and `uat` both parse to `AppEnv::Staging`, not `Development`; `test`
+      is rejected outright, never silently mapped to any tier; every
+      deployment guardrail (Swagger off, HTTPS JWKS, HTTPS IdP base URL,
+      non-empty CORS allowlist, etc.) fires identically for `staging` and
+      `production` — i.e. is keyed off `!is_dev()`, verified by a test that
+      runs the same guardrail assertions against both tiers.
+- [ ] Outside `Development`, both `ADMIN_IDP_BASE_URL` and `ADMIN_JWKS_URL`
+      are checked for `https://`, **independently** — an https
+      `ADMIN_JWKS_URL` override must not excuse a plaintext
+      `ADMIN_IDP_BASE_URL` (the introspection endpoint defaults to a path
+      relative to the base URL, so a plaintext base URL is still a
+      token-forgery path even when the JWKS fetch itself is safe). See
+      §3.3 and `template/src/config.rs`'s `validate()` for the reference
+      pair of checks and `template/src/config.rs`'s
+      `an_explicit_https_jwks_url_does_not_excuse_a_plaintext_base_url`
+      test for the independence proof.
 - [ ] Admin-auth: a request with no `Authorization` header is 401; a request
       whose token fails offline verification (bad `kid`, expired, wrong
       `iss`) is 401; an unreachable/erroring JWKS endpoint is 503, not 401

@@ -207,6 +207,14 @@ impl Config {
         if !self.app_env.is_dev() {
             let env = self.app_env.as_str();
 
+            if !self.admin_idp.base_url.starts_with("https://") {
+                return Err(DomainError::Internal(format!(
+                    "ADMIN_IDP_BASE_URL must be https in {env}: it is also where the \
+                     introspection endpoint lives when ADMIN_INTROSPECT_PATH is left at its \
+                     default, so a plaintext base URL is a token-forgery path even when \
+                     ADMIN_JWKS_URL is overridden to something safe"
+                )));
+            }
             if !self.admin_idp.jwks_url.starts_with("https://") {
                 return Err(DomainError::Internal(format!(
                     "ADMIN_JWKS_URL must be https in {env}: the signing keys arrive over it, \
@@ -335,6 +343,11 @@ mod tests {
     #[test]
     fn every_deployed_environment_gets_the_same_guardrails() {
         for app_env in ["staging", "uat", "production"] {
+            let mut plaintext_base_url = deployed(app_env);
+            plaintext_base_url.insert("ADMIN_IDP_BASE_URL".into(), "http://api.maxion.game".into());
+            let err = Config::load(&plaintext_base_url).unwrap_err().to_string();
+            assert!(err.contains("ADMIN_IDP_BASE_URL"), "{app_env}: {err}");
+
             let mut plaintext_jwks = deployed(app_env);
             plaintext_jwks.insert(
                 "ADMIN_JWKS_URL".into(),
@@ -358,6 +371,22 @@ mod tests {
                 "{app_env} with every guardrail satisfied must boot"
             );
         }
+    }
+
+    /// A safe `ADMIN_JWKS_URL` override does not excuse a plaintext base
+    /// URL: `ADMIN_INTROSPECT_PATH` defaults off `ADMIN_IDP_BASE_URL`, so a
+    /// plaintext base URL is still a token-forgery path on the introspect
+    /// call even when the JWKS fetch itself is safe.
+    #[test]
+    fn an_explicit_https_jwks_url_does_not_excuse_a_plaintext_base_url() {
+        let mut env = deployed("production");
+        env.insert("ADMIN_IDP_BASE_URL".into(), "http://api.maxion.game".into());
+        env.insert(
+            "ADMIN_JWKS_URL".into(),
+            "https://api.maxion.game/.well-known/jwks.json".into(),
+        );
+        let err = Config::load(&env).unwrap_err().to_string();
+        assert!(err.contains("ADMIN_IDP_BASE_URL"), "{err}");
     }
 
     #[test]
