@@ -772,6 +772,47 @@ cover; it should be concrete enough to write from directly.
       `COPY` the path-dependency `maxion-admin-guard/rust`; see `news`'s
       Dockerfile for the working pattern to copy).
 
+**mailer specifically**
+
+- [ ] `APP_ENV` is required (no silent default); `staging`/`uat` parse to a
+      distinct `Staging` tier and `test` is rejected outright, same as the
+      rest of the fleet (`src/config.rs`, fixed `f2eeeaf` — this repo shipped
+      after the rest of the fleet already had the three-tier model, so it
+      never carried the two-tier gap idp/key-server once did).
+- [ ] Outside `Development`, the resolved `introspect_url` is checked for
+      `https://` independently of `ADMIN_JWKS_URL` (`f2eeeaf`) — the
+      `absolute_url(base, path)` passthrough is *kept*, per the §3.3/§7
+      "option A" decision now shared by six of the seven Rust repos, not
+      removed; a negative test (`http://evil` refused in staging/production,
+      accepted in development) mirrors utility's and key-server's.
+- [ ] `BASE_PATH` nests the whole router and both probes stay at the root
+      regardless of whether it's set (`tests/fallback.rs`'s
+      `an_unset_base_path_serves_everything_at_the_root` and
+      `base_path_nests_the_api_but_never_the_probes`).
+- [ ] CORS: `CORS_ALLOWED_ORIGINS` (already standard — see §3.2's note on the
+      `4d6842f` rename, pinned by its own conformance test so the pre-rename
+      name can't quietly come back), `allow_headers` includes `x-request-id`
+      (`src/inbound/router.rs`).
+- [ ] Team surface (`POST /v1/emails:send`, `GET /v1/jobs/{id}`) dual-accepts
+      `mxs_` (verified live via key-server, scope `email:send`) alongside the
+      unchanged legacy `mxk_` per-tenant lookup (`28fa7a4`, plan ADR D1).
+      `allowed_senders` comes from verify's `metadata.allowed_senders` and
+      nothing else — no metadata, or an empty array, grants zero senders,
+      never every sender; every non-clean-200 from key-server (including its
+      own `/v1/verify` 429 rate limiter) is a 503, never an implicit pass;
+      only a clean `active:false` is a 401. `key_id` is stored as
+      `mxs:{key_id}` everywhere it lands in this service's own text columns
+      (`jobs.key_id`, the audit trail), to keep the two id namespaces from
+      colliding.
+- [ ] The two sanctioned exceptions stay pinned by this repo's own test, not
+      merely assumed: the team surface keeps the nested `{"error": {"code",
+      "message"}}` envelope (§1.5) while the admin surface is flat per §1.1;
+      admin list pagination keeps Node's `page`/`pageSize` →
+      `{page,pageSize,total,totalPages,items}` (§2.4), not `page`/`take` +
+      `{items,meta}`. `tests/platform_conformance.rs`'s own doc comment spells
+      out why a "well-meaning fleet-wide sweep" is exactly what these guard
+      against — read that file before "fixing" either shape.
+
 **SPA (`web-platform-back-office`, M4 — not a Rust repo, listed for
 completeness)**
 
@@ -780,8 +821,8 @@ completeness)**
       fails `tsc`.
 - [ ] `format-error.ts`: a server response with a `message` field always
       shows that message; the status-code table is a fallback only.
-- [ ] `X-Request-Id` is attached on the six instances whose CORS allows it
-      (idp, keyServer, launcher, news, web, utility) and **not** on
+- [ ] `X-Request-Id` is attached on the seven instances whose CORS allows it
+      (idp, keyServer, launcher, news, web, utility, mailer) and **not** on
       `authServer` or `api`.
 - [ ] e2e preflight: every `FEATURE_KEYS` entry is a subset of
       `GET /api/v1/sites`'s live catalog (subset, not equality — the catalog
