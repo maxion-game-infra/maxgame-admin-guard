@@ -614,10 +614,30 @@ the live, enforced list (`is_known_scope`).
 | `LAUNCHER_COUPONS_PIPELINE_SECRET` | `x-pipeline-secret` | launcher (mu-alpha-pipeline coupon routes) | `platform:coupon-pipeline` |
 | `DOWNLOAD_APP_KEYS` (JSON map) | `X-Download-App-Key` | launcher (download-token minting) | not yet scoped — per-app, not per-service |
 | `ADMIN_API_KEYS` (env) / DB-backed key | `X-Admin-Key` | `maxgame-auth-server` (dual-accept alongside admin JWT — `X-Admin-Key` wins if present; see `src/interface/middleware/admin.rs:1-21`) | `authserver:games:read` already exists in the catalog (§6.3) as the landing spot |
-| ~~(env-configured admin key)~~ | ~~`x-admin-key`~~ | ~~`maxgame-email-server-legacy`~~ | **RETIRED** — `maxgame-mail-server` replaced it with `maxion-admin-guard` (super_admin only) on the admin surface. Its team surface still uses per-tenant `mxk_live_…` bearer keys, which are tenant credentials, not an S2S service key, so they do not belong in this table |
+| ~~(env-configured admin key)~~ | ~~`x-admin-key`~~ | ~~`maxgame-email-server-legacy`~~ | **RETIRED** — `maxgame-mail-server` replaced it with `maxion-admin-guard` (super_admin only) on the admin surface. Its team surface dual-accepts the legacy per-tenant `mxk_live_…` bearer key (a tenant credential, not an S2S service key, so it does not belong in this table) **and** a `mxs_` key-server key — see §6.5, not this table: mxs is the standard for this surface, not a legacy secret being tracked for a future migration |
 
 None of these are touched by this plan (plan §7 follow-up item 4). They are
 recorded so a future migration doesn't have to rediscover them.
+
+### 6.5 Services that accept `mxs_` (ADR D1)
+
+Unlike §6.4's registry — legacy secrets catalogued for a *future* migration
+onto key-server — this table is the live roster: a service already dual-accepts
+`mxs_` keys, verified through `POST /v1/verify` (§6.1), as one of its accepted
+credential forms today, alongside whatever legacy form it also keeps.
+
+| Service | Route(s) | Scope required | Identity mapping |
+|---|---|---|---|
+| `mailer` (`maxgame-mail-server`) | `POST /v1/emails:send`, `GET /v1/jobs/{id}` (both behind `require_team`) | `email:send` | `key_id` → stored as `mxs:{key_id}` in `jobs.key_id` and the audit trail (those columns are plain text with no FK, so the prefix is the discriminator that keeps the two id namespaces — this service's own `api_keys.id`, key-server's `key_id` — from colliding) · `team_name` → verify's `consumer` · `allowed_senders` → verify's `metadata.allowed_senders` (array of sender-id strings), **explicit only**: no `metadata`, no `allowed_senders` field, or an empty array all mean **no senders**, never "every sender". `/v1/verify` has no sender concept of its own — `metadata` is free-form — so this mapping is the only place enforcing the "empty means none, not all" rule an `email:send` key would otherwise bypass entirely, turning one key into the ability to impersonate every sender the service knows about. Source: `maxgame-mail-server/src/adapters/key_server.rs` (`VerifiedServiceKey::allowed_senders`) and `src/infrastructure/team_auth.rs` (`verify_via_key_server`) |
+
+Error taxonomy, same as §6.2 with one addition worth naming explicitly: a
+verdict of `active: false` (any of the four `reason` values in §6.1) is a
+401; **anything else that is not a clean 200-with-parseable-body — including
+a 429 from `/v1/verify`'s own rate limiter (120/min per IP) — is a 503**,
+never an implicit pass and never a fallback to the legacy credential form.
+`mailer`'s reference tests: `an mxs key with no metadata.allowed_senders is
+refused`, `an mxs key listing a different sender is refused`, `a rate-limited
+verify is service-unavailable, not a denial`.
 
 ---
 
