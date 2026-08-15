@@ -15,7 +15,7 @@ are out of scope except where they double as an admin surface.
 | Key | Service | Repo |
 |---|---|---|
 | `idp` | Admin identity provider | `maxgame-admin-auth-server` |
-| `authServer` | Player IdP + admin proxy (**FROZEN** — deployed to prod) | `maxgame-auth-server` |
+| `authServer` | Player IdP + admin proxy (rewrite/migration target — **FROZEN lifted 2026-08-15**; not connected to the running production system. FROZEN was never a statement about code quality, only "we can't safely change this," and had been used to justify several exemptions below that no longer hold on that basis — see §2, §3.5, §5.4, and `maxgame-auth-server/tests/platform_conformance.rs`) | `maxgame-auth-server` |
 | `keyServer` | S2S service-key issuance + verification | `maxgame-key-server` |
 | `launcher` | Launcher/games/downloads admin | `maxgame-launcher-backend` |
 | `news` | News admin | `maxgame-news-backend` |
@@ -210,7 +210,9 @@ deployed, so this is free to change.
   below 1 is a 400. Those are bug-for-bug parity with the live relay, pinned
   by tests.
 
-- **`authServer` (FROZEN — deployed to prod):**
+- **`authServer` (no longer FROZEN as of 2026-08-15 — see the fleet table's
+  note; the reasoning below is evaluated on its own merits, not inherited
+  from that status):**
 
   ```json
   // GET /v1/admin/players?page=2&per_page=50
@@ -220,7 +222,26 @@ deployed, so this is free to change.
   Source: `maxgame-auth-server/src/interface/pagination.rs` (`PageQuery`)
   and `src/application/pagination.rs` (`Page<T>`). Field names are
   `page`/`per_page`/`total`/`total_pages`, not `page`/`take`/`itemCount`/
-  `pageCount`. **Do not touch** — this endpoint is live in production.
+  `pageCount`. **The merit that survives FROZEN's lift:**
+  `web-platform-back-office` already calls this endpoint directly
+  (`authServerEndpointsGroup`, `CLAUDE.md`'s API map) and parses this exact
+  shape today — converging it is a back-office change with a real live
+  caller to update, not a side effect of a backend test. **What's an open
+  question, not resolved here:** the old "do not touch — live in
+  production" line conflated two claims that used to travel together and no
+  longer necessarily do — "the SPA depends on this shape" (still true,
+  independent of FROZEN) and "this exact service is what's currently
+  serving production traffic" (uncertain now that FROZEN, the label that
+  assertion leaned on, has been lifted). Whether the second claim still
+  holds is for the user to determine; it doesn't change the first.
+  Separately: `GET /v1/admin/api-keys` (`interface::routes::admin_keys::list`)
+  answers the **identical** shape through the same `Page<T>` type — not
+  named in this exception's text even though, mechanically, there's no way
+  for one endpoint to conform to §2.1 without the other doing so too. See
+  `maxgame-auth-server/tests/platform_conformance.rs`'s
+  `admin_api_keys_list_shares_the_identical_undocumented_pagination_shape`.
+  Whether to widen this exception's text to cover it, or converge it
+  separately, is for the user to decide — not assumed here.
 
 - **`web` admin user-reports** keeps cursor/`limit`, not `page`/`take`:
 
@@ -545,15 +566,19 @@ Rust repo's router (`idp` `src/inbound/router.rs:90`, `launcher`
 `src/interface/routes/mod.rs:146`); `web-platform-backend/src/main.ts:39-45`
 and `src/libs/swagger/swagger.ts` for `api`.
 
-**Known gap — `authServer` has not converged, on purpose.** It still gates
-its mount with `OPENAPI_ENABLED` (`src/infrastructure/config/mod.rs:102`,
-default `true`), not the fleet's `SWAGGER_ENABLED` (default `false`), and —
-unlike `utility`/`keyServer` — has **no guardrail refusing to boot with it
-enabled outside `Development`**. This is a real, open non-conformance, not
-a documented exception: `authServer` is a live production deployment
-(§2's `FROZEN` note, §5.4), and renaming or re-defaulting an env var there
-was out of scope for the round of work that converged the other six repos.
-Tracked here so the next pass on this repo doesn't have to rediscover it.
+**Known gap — `authServer` has not converged.** It still gates its mount
+with `OPENAPI_ENABLED` (`src/infrastructure/config/mod.rs`, default `true`),
+not the fleet's `SWAGGER_ENABLED` (default `false`), and — unlike
+`utility`/`keyServer` — has **no guardrail refusing to boot with it enabled
+outside `Development`**. This is a real, open non-conformance. The reason it
+was left alone — "`authServer` is a live production deployment, out of
+scope for the round of work that converged the other six repos" — no longer
+holds: FROZEN was lifted 2026-08-15, and this repo is a rewrite/migration
+target, not a service whose deployment status this document can point to as
+a reason not to touch it. It remains unconverged only because nobody has
+done the work yet, not because of any surviving exemption — tracked here so
+the next pass on this repo doesn't have to rediscover it, and is now free to
+just fix it.
 
 **Services with no Swagger at all**, so a reader doesn't mistake the blank
 row above for a gap: `web` (`maxgame-web-backend`), `mailer`
@@ -759,9 +784,12 @@ and point a local `config.json` at `http://localhost:8093/news` — if the
 news list page still works, deployed config is confirmed to be nothing more
 than swapping a JSON file.
 
-**`authServer` stays FROZEN**: adding `/auth` at the ingress is additive
-(the existing `account.*` host is untouched), but `BASE_PATH` support inside
-`maxgame-auth-server` itself is a follow-up, not part of this plan.
+**`authServer`'s `BASE_PATH` support is still a follow-up, not part of this
+plan** — unaffected by FROZEN being lifted (2026-08-15). Adding `/auth` at
+the ingress remains additive (the existing `account.*` host is untouched)
+regardless of that status; implementing `BASE_PATH` inside
+`maxgame-auth-server` itself was never blocked by FROZEN in the first
+place, only not yet scheduled.
 
 ---
 
@@ -910,7 +938,12 @@ Each repo below writes and owns its own test for these — no shared test
 harness, per D0. This is the checklist a repo's conformance test (M5) must
 cover; it should be concrete enough to write from directly.
 
-**Every Rust repo (7): idp, keyServer, launcher, news, web, utility, mailer**
+**Every Rust repo (8): idp, keyServer, launcher, news, web, utility, mailer,
+authServer** — `authServer` was excluded from this count until 2026-08-15
+(it carried the FROZEN label discussed in the fleet table and §2/§3.5/§5.4);
+several items below apply to it only partially, per its own documented and
+open exceptions — see **authServer specifically** at the end of this
+section rather than assuming every bullet below applies unmodified.
 
 - [ ] Every error response is `{statusCode, message, error}` (§1.1); a 500's
       `message` is always exactly `"Internal server error"`; a 429 (where
@@ -1116,6 +1149,67 @@ cover; it should be concrete enough to write from directly.
       `{items,meta}`. `tests/platform_conformance.rs`'s own doc comment spells
       out why a "well-meaning fleet-wide sweep" is exactly what these guard
       against — read that file before "fixing" either shape.
+
+**authServer specifically** — first assessed against this section
+2026-08-15, the day FROZEN was lifted; `tests/platform_conformance.rs`
+(new, same day) is the source for every item below.
+
+- [ ] Health at root: `/healthz` answers exactly `{"status":"ok"}`; `/readyz`
+      answers exactly `{status, postgres_write, postgres_read, redis}` on
+      200/503, per §3.1's sanctioned three-extra-field row for this repo
+      (`postgres_write`/`postgres_read` gate the status code, `redis` is
+      reported only, not gating, as of the 2026-08-15 P0-4 readiness fix) —
+      `healthz_answers_exactly_the_contract_body`,
+      `readyz_reports_the_documented_extra_fields_without_dropping_status`.
+- [ ] The player API's `{error, message}` envelope is the sanctioned §1.1
+      exception (lines 10-13) —
+      `player_facing_errors_keep_the_repos_own_shape_which_platform_md_scopes_out`.
+      **`/v1/admin/*` answers the identical shape** through the same
+      `impl IntoResponse for AuthError`, which is **not** covered by that
+      exception — the admin surface is exactly what its "except where they
+      double as an admin surface" carve-out excludes, and it's the surface
+      `web-platform-back-office`'s `authServerEndpointsGroup` calls directly.
+      Pinned, not fixed, by
+      `admin_route_errors_use_the_same_two_field_shape_as_the_player_api`.
+      Open decision for the user — see §1 crosswalk above.
+- [ ] `GET /v1/admin/players` keeps §2's documented `page`/`per_page` →
+      `{items, page, per_page, total, total_pages}` shape —
+      `admin_players_list_keeps_the_documented_non_standard_pagination_shape`.
+      `GET /v1/admin/api-keys` shares the **identical** shape through the
+      same `Page<T>` type, not named in §2's exception text —
+      `admin_api_keys_list_shares_the_identical_undocumented_pagination_shape`.
+      Open decision for the user — see §2 above.
+- [ ] Every credential-bearing `reqwest::Client` refuses redirects (§6.2b) —
+      fixed fleet-wide 2026-08-14/15, including here: both of this repo's
+      clients (`services::admin_http_client`;
+      `infrastructure::adapters::http::build_http_client`, used by the
+      Google/Maxion providers) set `.redirect(Policy::none())`, proven by
+      `tests/admin_dual_auth_flow.rs`'s
+      `a_jwks_redirect_is_not_followed_and_the_request_fails_closed`.
+- [ ] Every 429 on the four rate-limited public routes
+      (login/login-url/refresh/redemptions) carries `Retry-After` through the
+      real router and middleware, not just the error type in isolation (§3.6
+      rule 1) — `tests/login_rate_limit_flow.rs`.
+- [ ] **Real, open gaps found while writing this repo's conformance test —
+      none fixed, none previously assessed here because the repo was outside
+      §1's scope while FROZEN:**
+  - [ ] No three-tier `AppEnv` (§3.4). `app_env` is a raw `String`
+        (`infrastructure::config::Config`); `Config::validate()`'s only
+        deployment guardrail branch is `is_production()`, so `staging`/`uat`
+        currently get the same relaxed rules as `development` — the exact
+        pattern §3.4 warns against. Pinned by
+        `staging_gets_the_same_relaxed_guardrails_as_development_today`.
+  - [ ] No resolved-URL https guardrail (§3.3). A plaintext
+        `ADMIN_IDP_BASE_URL` passes `Config::validate()` even with
+        `app_env=production` — unlike six of the seven other Rust repos.
+        Pinned by
+        `a_plaintext_admin_idp_url_passes_validate_in_production_because_no_https_guardrail_exists`.
+  - [ ] No CORS wildcard/empty refusal (§3.2). `CORS_ALLOWED_ORIGINS=*`
+        boots with no refusal anywhere in the chain. Pinned by
+        `a_wildcard_cors_origin_passes_validate_with_no_refusal_anywhere`.
+- [ ] Swagger/`OPENAPI_ENABLED` gap — see §3.5's "Known gap" note. Real,
+      still open, and no longer excused by a live-production-deployment
+      reason now that FROZEN is lifted.
 
 **SPA (`web-platform-back-office`, M4 — not a Rust repo, listed for
 completeness)**
