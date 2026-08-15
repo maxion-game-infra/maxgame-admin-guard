@@ -14,6 +14,6 @@
 # (currently 1.97) and update deploy-dev.yml's `container.image` to match.
 FROM rust:1.97-slim-bookworm
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends pkg-config git ca-certificates \
+    && apt-get install -y --no-install-recommends pkg-config git ca-certificates curl \
     && rm -rf /var/lib/apt/lists/* \
     && rustup component add rustfmt clippy
