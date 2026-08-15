@@ -106,6 +106,12 @@ struct JwksCache {
     /// Set on every fetch *attempt*. Drives the refetch floor, so a string
     /// of failures neither resets the TTL clock nor lifts the floor.
     last_attempt_at: Option<Instant>,
+    /// Whether the attempt at `last_attempt_at` failed (transport error,
+    /// non-2xx, unparseable body). Distinguishes, while the floor is active,
+    /// "we have a fresh key set and it just doesn't have this kid" (401)
+    /// from "we don't actually know what's in the key set right now" (503)
+    /// — contract rule 5. Meaningless when `last_attempt_at` is `None`.
+    last_attempt_failed: bool,
 }
 
 impl JwksCache {
@@ -204,6 +210,19 @@ impl JwksKeyProvider for AdminJwksClient {
 
         if let Some(last) = cache.last_attempt_at {
             if last.elapsed() < self.config.min_refetch_interval {
+                if cache.last_attempt_failed {
+                    // The floor is holding us back from a *retry*, not from
+                    // re-checking a key set we actually have — we don't know
+                    // whether this kid is good or bad, so this is an outage,
+                    // not a bad credential (contract rule 5).
+                    tracing::warn!(
+                        kid = %kid,
+                        "admin JWKS refetch skipped (floor active, last attempt failed)"
+                    );
+                    return Err(GuardError::unavailable(
+                        "admin JWKS endpoint unreachable (refetch floor active)",
+                    ));
+                }
                 tracing::warn!(kid = %kid, "admin JWKS refetch skipped (floor active)");
                 return Err(GuardError::unauthorized(format!(
                     "unknown admin JWT kid '{kid}' (refetch floor active)"
@@ -214,7 +233,16 @@ impl JwksKeyProvider for AdminJwksClient {
         cache.last_attempt_at = Some(Instant::now());
         // Fail-closed: on Err the cache is left exactly as it was, so a
         // reachable-again IdP restores service without a restart.
-        let (keys, ttl) = self.fetch().await?;
+        let (keys, ttl) = match self.fetch().await {
+            Ok(fetched) => {
+                cache.last_attempt_failed = false;
+                fetched
+            }
+            Err(e) => {
+                cache.last_attempt_failed = true;
+                return Err(e);
+            }
+        };
         cache.keys = keys;
         cache.ttl = Some(ttl);
         cache.fetched_at = Some(Instant::now());
@@ -322,6 +350,100 @@ mod tests {
         assert!(
             matches!(err, GuardError::Unavailable(_)),
             "expected Unavailable, got {err:?}"
+        );
+    }
+
+    /// A valid `{"keys": [...]}` body carrying one Ed25519 JWK under `kid`.
+    fn jwks_body_with_key(kid: &str, key: VerifyingKey) -> serde_json::Value {
+        serde_json::json!({
+            "keys": [{
+                "kty": "OKP",
+                "crv": "Ed25519",
+                "kid": kid,
+                "x": URL_SAFE_NO_PAD.encode(key.to_bytes()),
+            }]
+        })
+    }
+
+    /// The bug this module exists to guard against: `last_attempt_at` is
+    /// stamped before the fetch, so a failed fetch used to leave the floor
+    /// window answering 401 ("bad credential") instead of 503 ("cannot
+    /// tell") for every request until the floor lifted — turning one IdP
+    /// blip into a run of false "this token is dead" verdicts. Two requests
+    /// back-to-back against a cold cache and an unreachable IdP (well inside
+    /// `min_refetch_interval`) must both come back `Unavailable`.
+    #[tokio::test]
+    async fn every_request_within_the_floor_is_unavailable_when_the_last_attempt_failed() {
+        let client = short_timeout_client("http://127.0.0.1:1/jwks.json".to_string());
+
+        let first = client.resolve_key("any-kid").await.unwrap_err();
+        assert!(
+            matches!(first, GuardError::Unavailable(_)),
+            "expected Unavailable on the first (fetching) request, got {first:?}"
+        );
+
+        // Still inside min_refetch_interval (5s default) — this must not
+        // fall back to "unknown kid" just because the floor is active.
+        let second = client.resolve_key("any-kid").await.unwrap_err();
+        assert!(
+            matches!(second, GuardError::Unavailable(_)),
+            "expected Unavailable on the floor-active retry, got {second:?}"
+        );
+    }
+
+    /// Contract rule 5, the other half: once a key set has actually arrived,
+    /// a `kid` it doesn't contain is a bad credential, not an outage — even
+    /// though this request is the one that just performed the fetch.
+    #[tokio::test]
+    async fn a_freshly_fetched_key_set_missing_the_kid_is_unauthorized() {
+        let server = MockServer::start().await;
+        let present_key = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]).verifying_key();
+        Mock::given(method("GET"))
+            .and(path("/jwks.json"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(jwks_body_with_key("present-kid", present_key)),
+            )
+            .mount(&server)
+            .await;
+
+        let client = short_timeout_client(format!("{}/jwks.json", server.uri()));
+        let err = client.resolve_key("absent-kid").await.unwrap_err();
+        assert!(
+            matches!(err, GuardError::Unauthorized(_)),
+            "expected Unauthorized, got {err:?}"
+        );
+    }
+
+    /// Contract rule 5: the floor being active after a *successful* fetch is
+    /// unchanged by this fix — a second unknown `kid` inside the floor still
+    /// answers 401 without a second network call, it just no longer shares
+    /// a code path with "the fetch itself failed".
+    #[tokio::test]
+    async fn the_floor_after_a_successful_fetch_still_answers_unauthorized_without_refetching() {
+        let server = MockServer::start().await;
+        let present_key = ed25519_dalek::SigningKey::from_bytes(&[6u8; 32]).verifying_key();
+        Mock::given(method("GET"))
+            .and(path("/jwks.json"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(jwks_body_with_key("present-kid", present_key)),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = short_timeout_client(format!("{}/jwks.json", server.uri()));
+
+        let first = client.resolve_key("absent-kid").await.unwrap_err();
+        assert!(matches!(first, GuardError::Unauthorized(_)));
+
+        // Inside the floor: must stay 401, and `.expect(1)` above fails the
+        // test on drop if this triggers a second HTTP call.
+        let second = client.resolve_key("absent-kid").await.unwrap_err();
+        assert!(
+            matches!(second, GuardError::Unauthorized(_)),
+            "expected Unauthorized (unchanged), got {second:?}"
         );
     }
 
