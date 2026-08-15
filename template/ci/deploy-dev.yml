@@ -85,6 +85,14 @@ jobs:
           TEST_DATABASE_URL: postgres://postgres:ci@postgres:5432/postgres
         run: ./scripts/ci.sh
 
+      # This job runs in a container as root, but build-push/deploy-dev run
+      # on the host as the runner user (uid 1000) sharing the same _work
+      # directory — without this, their checkout cleanup dies with EACCES
+      # on root-owned files (proven by pilot run 31888287393).
+      - name: Fix workspace ownership for host jobs
+        if: always()
+        run: chown -R 1000:1000 "$GITHUB_WORKSPACE"
+
   build-push:
     needs: test
     runs-on: [self-hosted, Linux, X64, office]
