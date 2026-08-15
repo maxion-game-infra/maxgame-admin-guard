@@ -59,6 +59,13 @@ jobs:
       - name: Install pkg-config
         run: apt-get update && apt-get install -y pkg-config
 
+      # The official rust image installs its toolchain with rustup's
+      # `minimal` profile — no rustfmt, no clippy. ci.sh runs both, so add
+      # them explicitly (proven by pilot run 31888100508: "cargo-fmt is not
+      # installed for the toolchain").
+      - name: Install rustfmt + clippy
+        run: rustup component add rustfmt clippy
+
       - name: Cache cargo registry
         uses: actions/cache@v4
         with:
