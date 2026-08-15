@@ -1,0 +1,175 @@
+# Canonical deploy-dev workflow for Maxion Rust backend services.
+#
+# Copy this file into a repo as `.github/workflows/deploy-dev.yml` and fill
+# in the two placeholders in the `env:` block below — see README.md in this
+# directory for the full copy steps and the per-repo values table. Nothing
+# else in this template should need to change per repo; if it does, fix the
+# template first and re-copy, don't hand-edit one repo's copy out of sync.
+#
+# Shape: tag push -> test (gate) -> build & push image (WIF, keyless) ->
+# bump the image tag in maxgame-dev-gitopt (ArgoCD then syncs it).
+name: deploy-dev
+
+on:
+  push:
+    tags:
+      - 'dev-v*'
+
+# One deploy-dev run at a time, fleet-wide: the test job's Postgres service
+# container and the runner's Docker/AR auth are shared per-runner resources,
+# and two app repos tagging at once would otherwise race here.
+concurrency:
+  group: deploy-dev
+  cancel-in-progress: false
+
+env:
+  # Per-repo: short app name. Must match the Artifact Registry image name
+  # AND the `workloads/<app>/` directory in maxgame-dev-gitopt.
+  # e.g. "admin-auth" — see README.md for the full table.
+  APP: REPLACE_ME_app_name
+  # Per-repo: this repo's own directory name. Used as the checkout `path:`
+  # and as the working directory for `scripts/ci.sh` and the Dockerfile.
+  # e.g. "maxgame-admin-auth-server".
+  REPO_DIR: REPLACE_ME_repo_dir
+
+jobs:
+  # Gate: build-push does not run unless this passes.
+  test:
+    runs-on: [self-hosted, Linux, X64, office]
+    container: rust:1.97-slim-bookworm
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_PASSWORD: ci
+    steps:
+      - name: Checkout ${{ env.REPO_DIR }}
+        uses: actions/checkout@v4
+        with:
+          path: ${{ env.REPO_DIR }}
+
+      # Sibling layout so the Cargo path-dep `../maxgame-admin-guard/rust`
+      # resolves exactly like it does in local dev and in the Dockerfile.
+      - name: Checkout maxgame-admin-guard
+        uses: actions/checkout@v4
+        with:
+          repository: maxion-game-infra/maxgame-admin-guard
+          path: maxgame-admin-guard
+
+      - name: Install pkg-config
+        run: apt-get update && apt-get install -y pkg-config
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: /usr/local/cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ env.APP }}-${{ hashFiles(format('{0}/Cargo.lock', env.REPO_DIR)) }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-${{ env.APP }}-
+
+      # TEST_DATABASE_URL is the ONLY db env var this ever sets. Never
+      # DATABASE_URL/MIGRATION_DATABASE_URL, never a .env file — ci.sh reads
+      # exclusively from TEST_DATABASE_URL and refuses anything but a local
+      # host (localhost/127.0.0.1/::1/postgres) precisely so this can't drift
+      # onto a pooled or deployed database by accident.
+      - name: Run scripts/ci.sh
+        working-directory: ${{ env.REPO_DIR }}
+        env:
+          TEST_DATABASE_URL: postgres://postgres:ci@postgres:5432/postgres
+        run: ./scripts/ci.sh
+
+  build-push:
+    needs: test
+    runs-on: [self-hosted, Linux, X64, office]
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Checkout ${{ env.REPO_DIR }}
+        uses: actions/checkout@v4
+        with:
+          path: ${{ env.REPO_DIR }}
+
+      # Fresh workspace for this job — repeat the sibling checkout.
+      - name: Checkout maxgame-admin-guard
+        uses: actions/checkout@v4
+        with:
+          repository: maxion-game-infra/maxgame-admin-guard
+          path: maxgame-admin-guard
+
+      - name: Authenticate to GCP (Workload Identity Federation, keyless)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: projects/465412464495/locations/global/workloadIdentityPools/github-pool/providers/github-provider
+          service_account: maxgame-plat-dev-artifact-push@maxion-game-platform.iam.gserviceaccount.com
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker asia-southeast1-docker.pkg.dev --quiet
+
+      # Build context is the workspace parent (this job's root), matching
+      # every repo's Dockerfile header — the guard sibling above must be
+      # inside it. Each repo's own Dockerfile.dockerignore trims the context
+      # back down; this workflow does not need to know its contents.
+      - name: Build and push image
+        run: |
+          set -euo pipefail
+          IMAGE="asia-southeast1-docker.pkg.dev/maxion-game-platform/maxgame-platform-dev/${{ env.APP }}"
+          SHA_TAG="dev-$(git -C "${{ env.REPO_DIR }}" rev-parse --short HEAD)"
+          docker build \
+            -f "${{ env.REPO_DIR }}/Dockerfile" \
+            -t "${IMAGE}:${GITHUB_REF_NAME}" \
+            -t "${IMAGE}:${SHA_TAG}" \
+            .
+          docker push "${IMAGE}:${GITHUB_REF_NAME}"
+          docker push "${IMAGE}:${SHA_TAG}"
+
+  deploy-dev:
+    needs: build-push
+    runs-on: [self-hosted, Linux, X64, office]
+    steps:
+      # GITOPS_SSH_KEY is an org secret: a write-only deploy key scoped to
+      # maxgame-dev-gitopt only, provisioned once outside this workflow.
+      - name: Checkout maxgame-dev-gitopt
+        uses: actions/checkout@v4
+        with:
+          repository: maxion-game-infra/maxgame-dev-gitopt
+          ssh-key: ${{ secrets.GITOPS_SSH_KEY }}
+          ref: main
+          path: maxgame-dev-gitopt
+
+      - name: Bump image tag
+        working-directory: maxgame-dev-gitopt
+        run: |
+          set -euo pipefail
+          DEPLOY_FILE="workloads/${{ env.APP }}/deployment.yaml"
+          IMAGE="asia-southeast1-docker.pkg.dev/maxion-game-platform/maxgame-platform-dev/${{ env.APP }}"
+          sed -i -E "s#(image: ${IMAGE}:).*#\1${GITHUB_REF_NAME}#" "$DEPLOY_FILE"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add "$DEPLOY_FILE"
+          git commit -m "deploy(${{ env.APP }}): ${GITHUB_REF_NAME}"
+
+      # Two repos tagging at once can both land here together; retry the
+      # push against a fresh rebase rather than failing the whole run.
+      - name: Push to gitops main (retry on race)
+        working-directory: maxgame-dev-gitopt
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            if git push origin HEAD:main; then
+              exit 0
+            fi
+            echo "push failed (attempt ${attempt}/3) — pulling and retrying"
+            git pull --rebase origin main
+          done
+          echo "::error::failed to push maxgame-dev-gitopt after 3 attempts"
+          exit 1
+
+# ── prod (v*) — not created yet, no prod deploy exists. Stub only. ────────
+# Same three-job shape as above, pointed at the prod Artifact Registry repo
+# and the prod gitops target once those exist.
+#
+# on:
+#   push:
+#     tags:
+#       - 'v*'
