@@ -3,6 +3,11 @@ name = "maxion-admin-guard"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.82"
+license = "Apache-2.0"
+repository = "https://github.com/maxion-game-infra/maxgame-admin-guard"
+# Consumed as a path dependency by the eight platform services, not from a
+# registry — see the repository README for why. `publish = false` keeps an
+# accidental `cargo publish` from putting a platform-specific crate on crates.io.
 publish = false
 description = "Shared admin-auth verifier: offline JWKS/EdDSA verification, live introspection, circuit breaker, and site/feature authorization. Implements the contract in ../contract/README.md."
 

@@ -2,7 +2,7 @@
   "name": "@maxion/admin-guard",
   "version": "0.1.0",
   "description": "Shared admin-auth contract (offline JWKS verification, live introspection, circuit breaker, site/feature authorization) as a framework-free core with NestJS guard and plain-Node middleware adapters.",
-  "license": "UNLICENSED",
+  "license": "Apache-2.0",
   "private": true,
   "type": "module",
   "main": "./dist/index.cjs",
