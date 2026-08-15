@@ -30,10 +30,22 @@ patch one repo's copy out of sync with the rest.
      `gcloud iam service-accounts add-iam-policy-binding` command (pool and
      provider are already active fleet-wide; only the per-repo binding is
      new — see `maxion-k3s-dev` skill, `references/gitops.md`).
-   - **`GITOPS_SSH_KEY`**: already exists as an **org secret** on
-     `maxion-game-infra` (a write-only deploy key scoped to
-     `maxgame-dev-gitopt`) — every repo's copy of this workflow references it
-     as-is, nothing to provision per repo.
+   - **`GITOPS_SSH_KEY`**: must be set as a **repo-level** Actions secret
+     on every repo that copies this workflow:
+
+     ```bash
+     gh secret set GITOPS_SSH_KEY \
+       --repo maxion-game-infra/<this-repo> < <path-to-deploy-key-private>
+     ```
+
+     The value is the write-only deploy key for `maxgame-dev-gitopt`
+     (private half kept by the operator; see the k3s skill's gitops
+     reference). An org-level secret was tried first and silently does NOT
+     work: `maxion-game-infra` is on the GitHub **Free** plan, and org
+     secrets are only delivered to workflows in *public* repositories on
+     that plan — the workflow just sees an empty string, checkout falls
+     back to HTTPS with the app repo's token, and dies with
+     `repository not found` (proven by pilot run 31889602088).
 5. Tag `dev-vX.Y.Z` to trigger.
 
 ## Per-repo values
