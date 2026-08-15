@@ -113,13 +113,19 @@ jobs:
           path: maxgame-admin-guard
 
       - name: Authenticate to GCP (Workload Identity Federation, keyless)
+        id: gcp-auth
         uses: google-github-actions/auth@v2
         with:
           workload_identity_provider: projects/465412464495/locations/global/workloadIdentityPools/github-pool/providers/github-provider
           service_account: maxgame-plat-dev-artifact-push@maxion-game-platform.iam.gserviceaccount.com
+          token_format: access_token
 
-      - name: Configure Docker for Artifact Registry
-        run: gcloud auth configure-docker asia-southeast1-docker.pkg.dev --quiet
+      # The runner host has no gcloud CLI, and none is needed: auth@v2
+      # mints an OAuth access token directly, and docker login accepts it
+      # as the password for the special `oauth2accesstoken` user (proven
+      # by pilot run 31888986125: "gcloud: command not found").
+      - name: Docker login to Artifact Registry
+        run: echo "${{ steps.gcp-auth.outputs.access_token }}" | docker login -u oauth2accesstoken --password-stdin asia-southeast1-docker.pkg.dev
 
       # Build context is the workspace parent (this job's root), matching
       # every repo's Dockerfile header — the guard sibling above must be
