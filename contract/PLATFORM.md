@@ -724,7 +724,13 @@ a preference:
 
 **The rules:**
 
-- No `sqlx::migrate!().run()` (or equivalent) anywhere in `src/`.
+- No `sqlx::migrate!().run()` (or equivalent) reachable from the **server
+  binary**. A dedicated setup tool may still apply migrations — `idp`'s
+  `src/bin/seed_admin.rs` does, so a fresh database can be brought up without
+  the server having started — but nothing on the serving path may, and an
+  unreachable `migrate()` helper left behind in the crate counts as a
+  violation rather than a harmless leftover: it is the thing someone wires
+  back into boot later because it was already there.
 - Every repo with migrations ships **`scripts/migrate.sh`** — the same thin
   wrapper around `sqlx migrate run` in each, resolving `DATABASE_URL` from the
   environment and falling back to the repo's `.env`, failing loudly if unset.
@@ -995,8 +1001,11 @@ several items below apply to it only partially, per its own documented and
 open exceptions — see **authServer specifically** at the end of this
 section rather than assuming every bullet below applies unmodified.
 
-- [ ] No `sqlx::migrate!().run()` anywhere in `src/` (§3.7); a repo with
-      migrations ships `scripts/migrate.sh` and refuses to boot outside
+- [ ] No `sqlx::migrate!().run()` reachable from the server binary, and no
+      unreachable `migrate()` helper left in the crate (§3.7 — a dedicated
+      setup tool such as `idp`'s `seed_admin` bin is the one exception); a
+      repo with migrations ships `scripts/migrate.sh` and refuses to boot
+      outside
       development when `_sqlx_migrations` is behind the embedded version,
       naming both versions — and treats a missing table, a query error and a
       timeout identically as "cannot confirm".
