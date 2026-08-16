@@ -795,10 +795,49 @@ place, only not yet scheduled.
 
 ## 6. Service-to-service: key-server `/v1/verify` (ADR D7)
 
-Every **new** S2S integration on this platform authenticates via a
-`mxs_...` key issued by `maxgame-key-server` and verified through this one
-endpoint. Existing legacy secrets (§6.3) are not being migrated by this
-plan — they're catalogued here so the eventual migration has a map.
+Every **new** S2S integration whose caller sits outside this fleet (tier 3
+of §6.0 below) authenticates via a `mxs_...` key issued by
+`maxgame-key-server` and verified through this one endpoint. Fleet-internal
+callers (tier 2 of §6.0) do not use this mechanism at all. Existing legacy
+secrets not yet covered by either tier (§6.4) are not being migrated by
+this plan — they're catalogued here so the eventual migration has a map.
+
+### 6.0 Three tiers of caller
+
+Decided 2026-08-16 (`2026-08-16-internal-s2s-design.md`), this platform
+recognizes exactly three kinds of caller, and every route on every service
+belongs to exactly one tier:
+
+1. **A human (admin) through the browser.** Admin JWT, verified per the
+   eight-rule contract at [`contract/README.md`](./README.md) (§4 above) —
+   unchanged.
+2. **A server inside this fleet, calling another server in this fleet.**
+   The caller reaches the callee directly over cluster-internal DNS and
+   hits a route namespace under **`/internal/*`** that carries **no auth at
+   all**. Security here is the network boundary, not a credential: a
+   ClusterIP service has no path in from outside the cluster, and the one
+   rule every gateway must hold without exception is **`/internal/` must
+   never appear in any ingress, on any path, ever.** The platform gateway
+   is an explicit path allowlist it controls; `maxgame-auth-server`'s own
+   ingress is an allowlist regex (`maxgame-dev-gitopt/workloads/gateway/
+   ingress-auth-server.yaml`) — both keep excluding this prefix by
+   construction, not by omission, and both carry a comment saying so. A
+   caller may send
+   `X-Internal-Caller: <service-name>` as a debug courtesy; the callee logs
+   it if present but never verifies it, and there is deliberately **no
+   audit trail** between fleet members calling each other this way — the
+   platform philosophy (per the design doc) is that communication *inside*
+   the fleet should be as simple as possible: no key issuance, no key
+   rotation, no verify round-trip, nothing to audit.
+3. **A server outside the platform** — cloud functions, partners, external
+   CI. `mxs_...` key-server key + `POST /v1/verify` (§6.1, unchanged).
+   **Repositioning:** key-server is now exclusively the credential for this
+   tier. It is the "national ID card for a server that lives outside the
+   platform," not a mechanism fleet members use on each other — that's
+   tier 2's job, and tier 2 carries no key at all. §6.5's roster of
+   `mxs_`-accepting services is unaffected: those are all genuinely
+   tier-3-facing surfaces (partner uploads, external CI, the team-facing
+   mail API), not fleet-internal calls.
 
 ### 6.1 Request / response
 
@@ -904,7 +943,7 @@ the live, enforced list (`is_known_scope`).
 | `LAUNCHER_RELEASE_API_KEY` / `GAME_RELEASE_API_KEY` | `x-release-api-key` | launcher (the two `ci-register` routes) | `platform:release-upload` |
 | `LAUNCHER_COUPONS_PIPELINE_SECRET` | `x-pipeline-secret` | launcher (mu-alpha-pipeline coupon routes) | `platform:coupon-pipeline` |
 | `DOWNLOAD_APP_KEYS` (JSON map) | `X-Download-App-Key` | launcher (download-token minting) | not yet scoped — per-app, not per-service |
-| `ADMIN_API_KEYS` (env) / DB-backed key | `X-Admin-Key` | `maxgame-auth-server` (dual-accept alongside admin JWT — `X-Admin-Key` wins if present; see `src/interface/middleware/admin.rs:1-21`) | `authserver:games:read` already exists in the catalog (§6.3) as the landing spot |
+| ~~`ADMIN_API_KEYS` (env) / DB-backed key~~ | ~~`X-Admin-Key`~~ | ~~`maxgame-auth-server`~~ | **RETIRED 2026-08-16** — not migrated onto key-server, deleted outright. Its one caller, `maxgame-launcher-backend`, is tier 2 of §6.0: it now reaches `maxgame-auth-server` over cluster-internal DNS under `/internal/v1/*` with no credential at all (no key, no header, no verify round-trip). The DB-backed key table, its CRUD routes, and the dual-accept branch in `src/interface/middleware/admin.rs` are removed, not preserved as a legacy fallback — see `2026-08-16-internal-s2s-design.md` (P1/P2). Admin JWT is now the only credential form this service's `/v1/admin/*` routes accept. |
 | ~~(env-configured admin key)~~ | ~~`x-admin-key`~~ | ~~`maxgame-email-server-legacy`~~ | **RETIRED** — `maxgame-mail-server` replaced it with `maxion-admin-guard` (super_admin only) on the admin surface. Its team surface dual-accepts the legacy per-tenant `mxk_live_…` bearer key (a tenant credential, not an S2S service key, so it does not belong in this table) **and** a `mxs_` key-server key — see §6.5, not this table: mxs is the standard for this surface, not a legacy secret being tracked for a future migration |
 
 None of these are touched by this plan (plan §7 follow-up item 4). They are
