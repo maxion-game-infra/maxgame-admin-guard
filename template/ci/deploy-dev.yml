@@ -23,12 +23,14 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  # Per-repo: short app name. Must match the Artifact Registry image name
-  # AND the `workloads/<app>/` directory in maxgame-dev-gitopt.
-  # e.g. "admin-auth" — see README.md for the full table.
+  # Per-repo: the repo's full name — identical to REPO_DIR below. Doubles
+  # as the Artifact Registry image name AND the `workloads/<app>/`
+  # directory in maxgame-dev-gitopt.
+  # e.g. "maxgame-admin-auth-server" — see README.md for the full table.
   APP: REPLACE_ME_app_name
-  # Per-repo: this repo's own directory name. Used as the checkout `path:`
-  # and as the working directory for `scripts/ci.sh` and the Dockerfile.
+  # Per-repo: this repo's own directory name (same value as APP above).
+  # Used as the checkout `path:` and as the working directory for
+  # `scripts/ci.sh` and the Dockerfile.
   # e.g. "maxgame-admin-auth-server".
   REPO_DIR: REPLACE_ME_repo_dir
 

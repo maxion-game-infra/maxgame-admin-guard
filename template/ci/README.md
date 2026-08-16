@@ -50,16 +50,18 @@ patch one repo's copy out of sync with the rest.
 
 ## Per-repo values
 
+`APP` is always identical to `REPO_DIR` — the repo's own full name.
+
 | `APP` | `REPO_DIR` | Artifact Registry image | Notes |
 | --- | --- | --- | --- |
-| `admin-auth` | `maxgame-admin-auth-server` | `.../maxgame-platform-dev/admin-auth` | pilot repo — first to get this workflow |
-| `auth-server` | `maxgame-auth-server` | `.../maxgame-platform-dev/auth-server` | |
-| `key-server` | `maxgame-key-server` | `.../maxgame-platform-dev/key-server` | |
-| `launcher` | `maxgame-launcher-backend` | `.../maxgame-platform-dev/launcher` | |
-| `news` | `maxgame-news-backend` | `.../maxgame-platform-dev/news` | |
-| `web` | `maxgame-web-backend` | `.../maxgame-platform-dev/web` | |
-| `utility` | `maxgame-utility-server` | `.../maxgame-platform-dev/utility` | no DB — see note below |
-| `mailer` | `maxgame-mail-server` | `.../maxgame-platform-dev/mailer` | |
+| `maxgame-admin-auth-server` | `maxgame-admin-auth-server` | `.../maxgame-platform-dev/maxgame-admin-auth-server` | pilot repo — first to get this workflow |
+| `maxgame-auth-server` | `maxgame-auth-server` | `.../maxgame-platform-dev/maxgame-auth-server` | |
+| `maxgame-key-server` | `maxgame-key-server` | `.../maxgame-platform-dev/maxgame-key-server` | |
+| `maxgame-launcher-backend` | `maxgame-launcher-backend` | `.../maxgame-platform-dev/maxgame-launcher-backend` | |
+| `maxgame-news-backend` | `maxgame-news-backend` | `.../maxgame-platform-dev/maxgame-news-backend` | |
+| `maxgame-web-backend` | `maxgame-web-backend` | `.../maxgame-platform-dev/maxgame-web-backend` | |
+| `maxgame-utility-server` | `maxgame-utility-server` | `.../maxgame-platform-dev/maxgame-utility-server` | no DB — see note below |
+| `maxgame-mail-server` | `maxgame-mail-server` | `.../maxgame-platform-dev/maxgame-mail-server` | |
 
 Full image path is
 `asia-southeast1-docker.pkg.dev/maxion-game-platform/maxgame-platform-dev/<APP>`
