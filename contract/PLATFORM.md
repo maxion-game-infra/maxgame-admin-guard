@@ -739,8 +739,8 @@ nests its whole router under it (axum `Router::nest(base_path, app)`).
 
 | Path | Service key | Repo |
 |---|---|---|
-| `/admin-auth` | `idp` | `maxgame-admin-auth-server` |
-| `/auth` | `authServer` | `maxgame-auth-server` (additive at the ingress; the existing `account.*` host keeps working unchanged — see §5.4) |
+| `/admin-accounts` | `idp` | `maxgame-admin-auth-server` |
+| `/accounts` | `authServer` | `maxgame-auth-server` (additive at the ingress; the existing `account.*` host keeps working unchanged — see §5.4) |
 | `/keys` | `keyServer` | `maxgame-key-server` |
 | `/launcher` | `launcher` | `maxgame-launcher-backend` |
 | `/news` | `news` | `maxgame-news-backend` |
