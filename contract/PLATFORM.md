@@ -611,6 +611,7 @@ Where a limiter does exist today:
 | `web` | `POST /admin/user-reports` (public submission) | IP (salted hash) | `USER_REPORTS_PER_HOUR=10` (documented exception, same as above) | **Postgres** (`rate_limit_counters`) — survives restarts, correct across replicas |
 | `launcher` | `POST /maxgame-launcher-coupons/redeem` | `player_id` | `RATE_LIMIT_COUPON_REDEEM_PER_MIN=10` | in-memory, per replica |
 | `authServer` *(out of scope — informative precedent only, see line 12)* | `POST /v1/auth/login`, `POST /v1/auth/{provider}/login-url`, `POST /v1/auth/refresh`, `POST /v1/launch/redemptions` | IP | `RATE_LIMIT_LOGIN_PER_MIN=10`, `RATE_LIMIT_LOGIN_URL_PER_MIN=30`, `RATE_LIMIT_REFRESH_PER_MIN=60`, `RATE_LIMIT_REDEMPTIONS_PER_MIN=10`, kill-switch `RATE_LIMIT_ENABLED=true` | **Redis** (fixed-window `INCR`+`EXPIRE`) — survives restarts, correct across replicas |
+| `authServer` | `POST /v1/auth/introspect` (public, `mxs_`-gated — added 2026-08-17, §6.5) | presented `mxs_` key (SHA-256; IP fallback for bodies with no parseable `mxs_` candidate — same shape as key-server's own limiter above, for the same SNAT reason) | `RATE_LIMIT_INTROSPECT_PER_MIN=600` | in-memory, per replica |
 
 Sources: `maxgame-admin-auth-server/src/config.rs:265-267`,
 `maxgame-key-server/src/config.rs:174`,
@@ -621,11 +622,15 @@ Sources: `maxgame-admin-auth-server/src/config.rs:265-267`,
 `maxgame-launcher-backend/src/modules/coupons/rate_limit.rs` +
 `.env.example:51`, `maxgame-auth-server/src/interface/middleware/rate_limit.rs`
 + `.env.example:38-42` + `src/infrastructure/adapters/rate_limit.rs`
-(`RedisRateLimiter`). `authServer`'s `POST /v1/auth/introspect` is
-deliberately **not** limited — game servers call it at a high, steady rate
-and it carries no secret to brute-force, so limiting it risks breaking games
-against a threat that doesn't apply to it
-(`maxgame-auth-server/src/interface/middleware/rate_limit.rs`'s module doc).
+(`RedisRateLimiter`). Before 2026-08-17, `authServer`'s
+`POST /v1/auth/introspect` was unauthenticated and deliberately **not**
+limited — game servers called it at a high, steady rate and it carried no
+secret to brute-force, so limiting it risked breaking games against a
+threat that didn't apply to it. That reasoning no longer holds once the
+route requires an `mxs_` key (§6.5): a credential now exists to brute-force
+and to key a limiter on, so it gets one — `RATE_LIMIT_INTROSPECT_PER_MIN`
+above, per key rather than per IP for the same reason key-server's own
+verify limiter is per key.
 
 Normative rules, extracted from the above rather than invented:
 
@@ -927,14 +932,15 @@ answering 307/308 and asserts the redirect target receives nothing.
 ### 6.3 Scope catalog
 
 ```
-idp:introspect             launcher:release-upload   launcher:coupon-pipeline
-email:send                 cs:jobs                   utility:partner-upload
+idp:introspect             accounts:introspect        launcher:release-upload
+launcher:coupon-pipeline   email:send                  cs:jobs
+utility:partner-upload
 ```
 
 Every scope is prefixed with the service that actually enforces it
 (`<service>:<action>`) — there is no shared `platform:` owner (that prefix
 was a NestJS-era holdover and no longer appears anywhere in the catalog).
-Reduced from 10 entries to these 6 on 2026-08-17: `platform:introspect` →
+Reduced from 10 entries to 6 on 2026-08-17: `platform:introspect` →
 `idp:introspect`, `platform:release-upload` → `launcher:release-upload`,
 `platform:coupon-pipeline` → `launcher:coupon-pipeline` (renamed onto their
 real owning service); `platform:partner-upload` and
@@ -943,7 +949,11 @@ the former duplicated `utility:partner-upload`, the latter's only would-be
 caller, NestJS zone4-presale, has always authenticated with its own
 `APP_X_API_KEY` and never held a key-server key); `email:admin` and
 `authserver:games:read` were deleted because their target credentials were
-themselves retired (see §6.4).
+themselves retired (see §6.4). `accounts:introspect` was added the same day
+(a second 2026-08-17 change, after the reduction to 6) so `maxgame-auth-server`
+— the player IdP, whose gateway path is `/accounts` — can gate its own
+`POST /v1/auth/introspect` to tier-3 external callers holding an `mxs_` key,
+bringing the catalog to 7; see §6.5 for the consumer.
 
 Source: `maxgame-key-server/src/domain/scopes.rs` (`SCOPE_CATALOG`) —
 the live, enforced list (`is_known_scope`).
@@ -964,22 +974,66 @@ recorded so a future migration doesn't have to rediscover them.
 ### 6.5 Services that accept `mxs_` (ADR D1)
 
 Unlike §6.4's registry — legacy secrets catalogued for a *future* migration
-onto key-server — this table is the live roster: a service already dual-accepts
-`mxs_` keys, verified through `POST /v1/verify` (§6.1), as one of its accepted
-credential forms today, alongside whatever legacy form it also keeps.
+onto key-server — this table is the live roster: a service that already
+accepts `mxs_` keys, verified through `POST /v1/verify` (§6.1), as one of its
+accepted credential forms today. That's two different shapes, not one:
+**dual-accept** services keep a legacy credential form alongside `mxs_` (e.g.
+`mailer`'s per-tenant `mxk_` key, `idp`'s shared `INTROSPECT_API_KEY`), while
+others accept `mxs_` **only**, with no legacy form at all (e.g. `utility`'s
+partner endpoint, `authServer`'s introspect route) — both belong in this
+table, the column that varies is "Identity mapping," not whether the row
+qualifies.
 
 | Service | Route(s) | Scope required | Identity mapping |
 |---|---|---|---|
-| `mailer` (`maxgame-mail-server`) | `POST /v1/emails:send`, `GET /v1/jobs/{id}` (both behind `require_team`) | `email:send` | `key_id` → stored as `mxs:{key_id}` in `jobs.key_id` and the audit trail (those columns are plain text with no FK, so the prefix is the discriminator that keeps the two id namespaces — this service's own `api_keys.id`, key-server's `key_id` — from colliding) · `team_name` → verify's `consumer` · `allowed_senders` → verify's `metadata.allowed_senders` (array of sender-id strings), **explicit only**: no `metadata`, no `allowed_senders` field, or an empty array all mean **no senders**, never "every sender". `/v1/verify` has no sender concept of its own — `metadata` is free-form — so this mapping is the only place enforcing the "empty means none, not all" rule an `email:send` key would otherwise bypass entirely, turning one key into the ability to impersonate every sender the service knows about. Source: `maxgame-mail-server/src/adapters/key_server.rs` (`VerifiedServiceKey::allowed_senders`) and `src/infrastructure/team_auth.rs` (`verify_via_key_server`) |
+| `mailer` (`maxgame-mail-server`) | `POST /v1/emails:send`, `GET /v1/jobs/{id}` (both behind `require_team`) | `email:send` | `key_id` → stored as `mxs:{key_id}` in `jobs.key_id` and the audit trail (those columns are plain text with no FK, so the prefix is the discriminator that keeps the two id namespaces — this service's own `api_keys.id`, key-server's `key_id` — from colliding) · `team_name` → verify's `consumer` · `allowed_senders` → verify's `metadata.allowed_senders` (array of sender-id strings), **explicit only**: no `metadata`, no `allowed_senders` field, or an empty array all mean **no senders**, never "every sender". `/v1/verify` has no sender concept of its own — `metadata` is free-form — so this mapping is the only place enforcing the "empty means none, not all" rule an `email:send` key would otherwise bypass entirely, turning one key into the ability to impersonate every sender the service knows about. Source: `maxgame-mail-server/src/adapters/key_server.rs` (`VerifiedServiceKey::allowed_senders`) and `src/infrastructure/team_auth.rs` (`verify_via_key_server`). Dual-accept, alongside the legacy `mxk_live_…` bearer key. |
+| `utility` (`maxgame-utility-server`) | `POST /v1/partner/presign-upload` | `utility:partner-upload` | `metadata.buckets` (array of bucket-name strings) → which R2 bucket(s) the key may presign into, **explicit only** same as `mailer`'s sender rule — absent/empty/non-array grants no bucket, never every bucket (`VerifiedServiceKey::may_use_bucket`). `mxs_`-only — no legacy credential form on this route. Source: `maxgame-utility-server/src/adapters/key_server.rs`, `src/infrastructure/service_key_auth.rs`. |
+| `authServer` (`maxgame-auth-server`) | `POST /v1/auth/introspect` | `accounts:introspect` | Possession-only gate: a valid key with the scope unlocks the route, the verify response otherwise isn't mapped onto anything — the route's own answer is the introspection result for the player access token in the request body, unrelated to the key's `key_id`/`consumer`/`metadata`. `mxs_`-only — this route carries no legacy shared secret to fall back to. Added 2026-08-17 (this plan) so external callers can introspect player tokens without a fleet-internal `/internal/*` hop; `x-verifier-service: auth-server`. Source: `maxgame-auth-server/src/adapters/key_server.rs`, `src/infrastructure/service_key_auth.rs`. |
+| `idp` (`maxgame-admin-auth-server`) | `POST /api/v1/oauth/introspect` | `idp:introspect` | Same possession-only gate as `authServer` above — verify only unlocks the route, the introspection result comes from the admin access token in the request body. **Dual-accept**: a credential starting with `mxs_` is verified via key-server; anything else falls back to a constant-time compare against the legacy shared `INTROSPECT_API_KEY`, with **no cross-fallback either direction** — an `mxs_` key that fails verification is never retried against the shared secret. Added 2026-08-17 (this plan) so external callers no longer need the shared secret every fleet member also holds; `x-verifier-service: admin-auth`. `KEY_SERVER_BASE_URL` is optional here (unlike the other rows) — unset disables only the `mxs_` path, so a deploy-order mistake can't take down the shared-key path every mutation in the fleet depends on. Source: `maxgame-admin-auth-server/src/adapters/key_server.rs`, `src/infrastructure/api_key.rs`. |
 
 Error taxonomy, same as §6.2 with one addition worth naming explicitly: a
 verdict of `active: false` (any of the four `reason` values in §6.1) is a
 401; **anything else that is not a clean 200-with-parseable-body — including
-a 429 from `/v1/verify`'s own rate limiter (120/min per IP) — is a 503**,
+a 429 from `/v1/verify`'s own rate limiter (per key, §3.6) — is a 503**,
 never an implicit pass and never a fallback to the legacy credential form.
 `mailer`'s reference tests: `an mxs key with no metadata.allowed_senders is
 refused`, `an mxs key listing a different sender is refused`, `a rate-limited
 verify is service-unavailable, not a denial`.
+
+**`KEY_SERVER_BASE_URL` / `KEY_SERVER_VERIFY_TIMEOUT_SECONDS`**, read by every
+row in this table, were never documented at the contract level before this
+plan — the only source was each repo's own `.env.example`. See §6.6 below.
+
+### 6.6 key-server consumer env set
+
+Every service in §6.5's roster (any service whose own code, not just a
+fleet-mate's, calls key-server's `POST /v1/verify`) reads:
+
+| Env var | Required? | Default |
+|---|---|---|
+| `KEY_SERVER_BASE_URL` | yes | — |
+| `KEY_SERVER_VERIFY_TIMEOUT_SECONDS` | no | `3` (seconds); `0` is rejected at boot — a zero timeout would fail every verify call closed before it could ever succeed |
+
+The verify path itself (`/v1/verify`) is a compile-time constant appended to
+`KEY_SERVER_BASE_URL`, not a separate env var — there is exactly one path on
+key-server's side, so nothing to override. Outside development,
+`KEY_SERVER_BASE_URL` must resolve to `https://`: the `/v1/verify` request
+body carries the caller's plaintext `mxs_` key, so a plaintext URL leaks the
+key in the clear (same reasoning as §3.3's `ADMIN_JWKS_URL`/introspect-URL
+https guardrail). `mailer` enforces this today
+(`maxgame-mail-server/src/config.rs`); `utility` does not yet — a known gap,
+not closed by this plan (plan §7 follow-up item 2) — so new consumers should
+follow `mailer`'s check, not copy `utility`'s.
+
+`idp` is the one exception on "required": because its `mxs_` path is
+additive dual-accept alongside the pre-existing shared `INTROSPECT_API_KEY`
+(§6.5 above), `KEY_SERVER_BASE_URL` is *optional* there — unset simply
+disables the `mxs_` branch rather than refusing to boot, so key-server being
+mid-deploy can never take the shared-key path down with it.
+
+Confirmed matching this shape in `maxgame-utility-server/src/config.rs`
+(`KeyServerConfig`, required + `parse_or(..., 3)`) and
+`maxgame-mail-server/src/config.rs` (same shape, plus the https check above).
 
 ---
 
