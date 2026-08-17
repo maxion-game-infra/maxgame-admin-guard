@@ -927,11 +927,23 @@ answering 307/308 and asserts the redirect target receives nothing.
 ### 6.3 Scope catalog
 
 ```
-platform:introspect          platform:release-upload      platform:partner-upload
-platform:presale-reconcile   platform:coupon-pipeline      email:send
-email:admin                  cs:jobs                       authserver:games:read
-utility:partner-upload
+idp:introspect             launcher:release-upload   launcher:coupon-pipeline
+email:send                 cs:jobs                   utility:partner-upload
 ```
+
+Every scope is prefixed with the service that actually enforces it
+(`<service>:<action>`) — there is no shared `platform:` owner (that prefix
+was a NestJS-era holdover and no longer appears anywhere in the catalog).
+Reduced from 10 entries to these 6 on 2026-08-17: `platform:introspect` →
+`idp:introspect`, `platform:release-upload` → `launcher:release-upload`,
+`platform:coupon-pipeline` → `launcher:coupon-pipeline` (renamed onto their
+real owning service); `platform:partner-upload` and
+`platform:presale-reconcile` were deleted outright (no key-server consumer —
+the former duplicated `utility:partner-upload`, the latter's only would-be
+caller, NestJS zone4-presale, has always authenticated with its own
+`APP_X_API_KEY` and never held a key-server key); `email:admin` and
+`authserver:games:read` were deleted because their target credentials were
+themselves retired (see §6.4).
 
 Source: `maxgame-key-server/src/domain/scopes.rs` (`SCOPE_CATALOG`) —
 the live, enforced list (`is_known_scope`).
@@ -940,8 +952,8 @@ the live, enforced list (`is_known_scope`).
 
 | Secret | Header | Repo(s) it protects | Target key-server scope |
 |---|---|---|---|
-| `LAUNCHER_RELEASE_API_KEY` / `GAME_RELEASE_API_KEY` | `x-release-api-key` | launcher (the two `ci-register` routes) | `platform:release-upload` |
-| `LAUNCHER_COUPONS_PIPELINE_SECRET` | `x-pipeline-secret` | launcher (mu-alpha-pipeline coupon routes) | `platform:coupon-pipeline` |
+| `LAUNCHER_RELEASE_API_KEY` / `GAME_RELEASE_API_KEY` | `x-release-api-key` | launcher (the two `ci-register` routes) | `launcher:release-upload` |
+| `LAUNCHER_COUPONS_PIPELINE_SECRET` | `x-pipeline-secret` | launcher (mu-alpha-pipeline coupon routes) | `launcher:coupon-pipeline` |
 | `DOWNLOAD_APP_KEYS` (JSON map) | `X-Download-App-Key` | launcher (download-token minting) | not yet scoped — per-app, not per-service |
 | ~~`ADMIN_API_KEYS` (env) / DB-backed key~~ | ~~`X-Admin-Key`~~ | ~~`maxgame-auth-server`~~ | **RETIRED 2026-08-16** — not migrated onto key-server, deleted outright. Its one caller, `maxgame-launcher-backend`, is tier 2 of §6.0: it now reaches `maxgame-auth-server` over cluster-internal DNS under `/internal/v1/*` with no credential at all (no key, no header, no verify round-trip). The DB-backed key table, its CRUD routes, and the dual-accept branch in `src/interface/middleware/admin.rs` are removed, not preserved as a legacy fallback — see `2026-08-16-internal-s2s-design.md` (P1/P2). Admin JWT is now the only credential form this service's `/v1/admin/*` routes accept. |
 | ~~(env-configured admin key)~~ | ~~`x-admin-key`~~ | ~~`maxgame-email-server-legacy`~~ | **RETIRED** — `maxgame-mail-server` replaced it with `maxion-admin-guard` (super_admin only) on the admin surface. Its team surface dual-accepts the legacy per-tenant `mxk_live_…` bearer key (a tenant credential, not an S2S service key, so it does not belong in this table) **and** a `mxs_` key-server key — see §6.5, not this table: mxs is the standard for this surface, not a legacy secret being tracked for a future migration |
