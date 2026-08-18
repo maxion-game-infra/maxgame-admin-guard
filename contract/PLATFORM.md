@@ -966,7 +966,7 @@ the live, enforced list (`is_known_scope`).
 | `LAUNCHER_COUPONS_PIPELINE_SECRET` | `x-pipeline-secret` | launcher (mu-alpha-pipeline coupon routes) | `launcher:coupon-pipeline` |
 | `DOWNLOAD_APP_KEYS` (JSON map) | `X-Download-App-Key` | launcher (download-token minting) | not yet scoped — per-app, not per-service |
 | ~~`ADMIN_API_KEYS` (env) / DB-backed key~~ | ~~`X-Admin-Key`~~ | ~~`maxgame-auth-server`~~ | **RETIRED 2026-08-16** — not migrated onto key-server, deleted outright. Its one caller, `maxgame-launcher-backend`, is tier 2 of §6.0: it now reaches `maxgame-auth-server` over cluster-internal DNS under `/internal/v1/*` with no credential at all (no key, no header, no verify round-trip). The DB-backed key table, its CRUD routes, and the dual-accept branch in `src/interface/middleware/admin.rs` are removed, not preserved as a legacy fallback — see `2026-08-16-internal-s2s-design.md` (P1/P2). Admin JWT is now the only credential form this service's `/v1/admin/*` routes accept. |
-| ~~(env-configured admin key)~~ | ~~`x-admin-key`~~ | ~~`maxgame-email-server-legacy`~~ | **RETIRED** — `maxgame-mail-server` replaced it with `maxion-admin-guard` (super_admin only) on the admin surface. Its team surface dual-accepts the legacy per-tenant `mxk_live_…` bearer key (a tenant credential, not an S2S service key, so it does not belong in this table) **and** a `mxs_` key-server key — see §6.5, not this table: mxs is the standard for this surface, not a legacy secret being tracked for a future migration |
+| ~~(env-configured admin key)~~ | ~~`x-admin-key`~~ | ~~`maxgame-email-server-legacy`~~ | **RETIRED** — `maxgame-mail-server` replaced it with `maxion-admin-guard` (super_admin only) on the admin surface. Its team surface dual-accepted the legacy per-tenant `mxk_live_…` bearer key (a tenant credential, not an S2S service key, so it never belonged in this table) alongside a `mxs_` key-server key until **Phase 4 of the mail-server key consolidation retired `mxk_live_…` outright (2026-08-18)** — the team surface now accepts `mxs_` only, see §6.5, not this table: mxs is the standard for this surface, not a legacy secret being tracked for a future migration |
 
 None of these are touched by this plan (plan §7 follow-up item 4). They are
 recorded so a future migration doesn't have to rediscover them.
@@ -978,15 +978,17 @@ onto key-server — this table is the live roster: a service that already
 accepts `mxs_` keys, verified through `POST /v1/verify` (§6.1), as one of its
 accepted credential forms today. That's two different shapes, not one:
 **dual-accept** services keep a legacy credential form alongside `mxs_` (e.g.
-`mailer`'s per-tenant `mxk_` key, `idp`'s shared `INTROSPECT_API_KEY`), while
-others accept `mxs_` **only**, with no legacy form at all (e.g. `utility`'s
-partner endpoint, `authServer`'s introspect route) — both belong in this
-table, the column that varies is "Identity mapping," not whether the row
+`idp`'s shared `INTROSPECT_API_KEY`), while others accept `mxs_` **only**,
+with no legacy form at all (e.g. `utility`'s partner endpoint, `authServer`'s
+introspect route, and — since Phase 4 of the mail-server key consolidation
+retired its legacy per-tenant `mxk_live_…` bearer key outright, 2026-08-18 —
+`mailer`'s team surface too, which dual-accepted until then) — both belong in
+this table, the column that varies is "Identity mapping," not whether the row
 qualifies.
 
 | Service | Route(s) | Scope required | Identity mapping |
 |---|---|---|---|
-| `mailer` (`maxgame-mail-server`) | `POST /v1/emails:send`, `GET /v1/jobs/{id}` (both behind `require_team`) | `email:send` | `key_id` → stored as `mxs:{key_id}` in `jobs.key_id` and the audit trail (those columns are plain text with no FK, so the prefix is the discriminator that keeps the two id namespaces — this service's own `api_keys.id`, key-server's `key_id` — from colliding) · `team_name` → verify's `consumer` · `allowed_senders` → verify's `metadata.allowed_senders` (array of sender-id strings), **explicit only**: no `metadata`, no `allowed_senders` field, or an empty array all mean **no senders**, never "every sender". `/v1/verify` has no sender concept of its own — `metadata` is free-form — so this mapping is the only place enforcing the "empty means none, not all" rule an `email:send` key would otherwise bypass entirely, turning one key into the ability to impersonate every sender the service knows about. Source: `maxgame-mail-server/src/adapters/key_server.rs` (`VerifiedServiceKey::allowed_senders`) and `src/infrastructure/team_auth.rs` (`verify_via_key_server`). Dual-accept, alongside the legacy `mxk_live_…` bearer key. |
+| `mailer` (`maxgame-mail-server`) | `POST /v1/emails:send`, `GET /v1/jobs/{id}` (both behind `require_team`) | `email:send` | `key_id` → stored **unprefixed** in `jobs.key_id` and the audit trail. Before Phase 4 of the mail-server key consolidation (2026-08-18) this was stored as `mxs:{key_id}`, prefixed to keep it from colliding with this service's own `api_keys.id` — Phase 4 dropped that table outright, so there is only one id namespace left and nothing to disambiguate · `team_name` → verify's `consumer`, which `modules::jobs_get`'s ownership check compares instead of `key_id` since Phase 4 (a rotated key gets a new `key_id` but keeps the same `consumer`) · `allowed_senders` → verify's `metadata.allowed_senders` (array of sender-id strings), **explicit only**: no `metadata`, no `allowed_senders` field, or an empty array all mean **no senders**, never "every sender". `/v1/verify` has no sender concept of its own — `metadata` is free-form — so this mapping is the only place enforcing the "empty means none, not all" rule an `email:send` key would otherwise bypass entirely, turning one key into the ability to impersonate every sender the service knows about. Source: `maxgame-mail-server/src/adapters/key_server.rs` (`VerifiedServiceKey::allowed_senders`) and `src/infrastructure/team_auth.rs` (`verify_via_key_server`). `mxs_`-only as of Phase 4 (2026-08-18) — the legacy per-tenant `mxk_live_…` bearer key this row used to dual-accept alongside `mxs_` was retired outright, not kept as a fallback. |
 | `utility` (`maxgame-utility-server`) | `POST /v1/partner/presign-upload` | `utility:partner-upload` | `metadata.buckets` (array of bucket-name strings) → which R2 bucket(s) the key may presign into, **explicit only** same as `mailer`'s sender rule — absent/empty/non-array grants no bucket, never every bucket (`VerifiedServiceKey::may_use_bucket`). `mxs_`-only — no legacy credential form on this route. Source: `maxgame-utility-server/src/adapters/key_server.rs`, `src/infrastructure/service_key_auth.rs`. |
 | `authServer` (`maxgame-auth-server`) | `POST /v1/auth/introspect` | `accounts:introspect` | Possession-only gate: a valid key with the scope unlocks the route, the verify response otherwise isn't mapped onto anything — the route's own answer is the introspection result for the player access token in the request body, unrelated to the key's `key_id`/`consumer`/`metadata`. `mxs_`-only — this route carries no legacy shared secret to fall back to. Added 2026-08-17 (this plan) so external callers can introspect player tokens without a fleet-internal `/internal/*` hop; `x-verifier-service: auth-server`. Source: `maxgame-auth-server/src/adapters/key_server.rs`, `src/infrastructure/service_key_auth.rs`. |
 | `idp` (`maxgame-admin-auth-server`) | `POST /api/v1/oauth/introspect` | `idp:introspect` | Same possession-only gate as `authServer` above — verify only unlocks the route, the introspection result comes from the admin access token in the request body. **Dual-accept**: a credential starting with `mxs_` is verified via key-server; anything else falls back to a constant-time compare against the legacy shared `INTROSPECT_API_KEY`, with **no cross-fallback either direction** — an `mxs_` key that fails verification is never retried against the shared secret. Added 2026-08-17 (this plan) so external callers no longer need the shared secret every fleet member also holds; `x-verifier-service: admin-auth`. `KEY_SERVER_BASE_URL` is optional here (unlike the other rows) — unset disables only the `mxs_` path, so a deploy-order mistake can't take down the shared-key path every mutation in the fleet depends on. Source: `maxgame-admin-auth-server/src/adapters/key_server.rs`, `src/infrastructure/api_key.rs`. |
@@ -1235,17 +1237,26 @@ section rather than assuming every bullet below applies unmodified.
       `4d6842f` rename, pinned by its own conformance test so the pre-rename
       name can't quietly come back), `allow_headers` includes `x-request-id`
       (`src/inbound/router.rs`).
-- [ ] Team surface (`POST /v1/emails:send`, `GET /v1/jobs/{id}`) dual-accepts
-      `mxs_` (verified live via key-server, scope `email:send`) alongside the
-      unchanged legacy `mxk_` per-tenant lookup (`28fa7a4`, plan ADR D1).
-      `allowed_senders` comes from verify's `metadata.allowed_senders` and
-      nothing else — no metadata, or an empty array, grants zero senders,
+- [ ] Team surface (`POST /v1/emails:send`, `GET /v1/jobs/{id}`) verifies
+      `mxs_` live via key-server, scope `email:send`, **only** — as of Phase 4
+      of the mail-server key consolidation
+      (`back-office-workspace/.omc/plans/2026-08-18-mailer-key-consolidation.md`,
+      executed 2026-08-18) there is no legacy `mxk_` per-tenant lookup left to
+      dual-accept alongside it; that path (`28fa7a4`, plan ADR D1) and the
+      `api_keys` table it read from were removed outright, not kept as a
+      fallback. `allowed_senders` comes from verify's `metadata.allowed_senders`
+      and nothing else — no metadata, or an empty array, grants zero senders,
       never every sender; every non-clean-200 from key-server (including its
       own `/v1/verify` 429 rate limiter) is a 503, never an implicit pass;
-      only a clean `active:false` is a 401. `key_id` is stored as
-      `mxs:{key_id}` everywhere it lands in this service's own text columns
-      (`jobs.key_id`, the audit trail), to keep the two id namespaces from
-      colliding.
+      only a clean `active:false` is a 401. `key_id` is stored **unprefixed**
+      everywhere it lands in this service's own text columns (`jobs.key_id`,
+      the audit trail) — the `mxs:{key_id}` prefix this row used to describe
+      existed only to keep key-server's `key_id` from colliding with this
+      service's own (now-deleted) `api_keys.id`; with `api_keys` gone there is
+      only one id namespace left, so nothing to disambiguate. Ownership
+      (`modules::jobs_get`) compares `team_name` (verify's `consumer`) rather
+      than `key_id`, since a rotated key gets a new `key_id` but keeps the
+      same `consumer`.
 - [ ] The two sanctioned exceptions stay pinned by this repo's own test, not
       merely assumed: the team surface keeps the nested `{"error": {"code",
       "message"}}` envelope (§1.5) while the admin surface is flat per §1.1;
