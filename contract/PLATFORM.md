@@ -20,7 +20,7 @@ are out of scope except where they double as an admin surface.
 | `launcher` | Launcher/games/downloads admin | `maxgame-launcher-backend` |
 | `news` | News admin | `maxgame-news-backend` |
 | `web` | Careers + user-reports admin | `maxgame-web-backend` |
-| `utility` | R2 presign (partner + admin) | `maxgame-utility-server` |
+| `utility` | R2 presign (partner + admin) + bucket registry admin CRUD | `maxgame-utility-server` |
 | `api` | Legacy remainder (zone4, email relay, user stats) | `web-platform-backend` (NestJS, being retired) |
 
 Every JSON example below is copied from a real source file, cited inline. A
@@ -92,7 +92,7 @@ retry later); a 500's `message` never is. Source: launcher
 
 Source: `maxgame-utility-server/src/inbound/error.rs` (`DomainError::error_code`) for the first eight. `CONFLICT` was added by `maxgame-key-server` (`src/error.rs`, `src/routes/admin_keys.rs` — its one 409 case, "key is already revoked") during M2, since the original eight had no 409 entry; sanctioned as a contract amendment rather than a repo-local invention, so the next repo with a 409 reuses it instead of picking its own string.
 
-**Ruling on vocabulary — a repo may keep its own `code` values.** idp's `code` field carries its pre-existing `DomainError` codes verbatim (`unauthorized`, `not_found`, `forbidden`, …, lowercase snake_case) rather than remapping onto this table's SCREAMING_CASE strings (`src/inbound/error.rs`, fixed in `f45b634` alongside the rest of §1.1). This is allowed: the requirement is that `code` be *stable and machine-readable within a service*, not that every service share one vocabulary — a client already scopes its branching by which service answered, so two services never need to compare `code` values against each other directly. §1.3's table remains the *recommended* starting vocabulary for a service with no existing one of its own (i.e. new services via the M6 template), not a mandate to remap an established one.
+**Ruling on vocabulary — a repo may keep its own `code` values.** idp's `code` field carries its pre-existing `DomainError` codes verbatim (`unauthorized`, `not_found`, `forbidden`, …, lowercase snake_case) rather than remapping onto this table's SCREAMING_CASE strings (`src/inbound/error.rs`, fixed in `f45b634` alongside the rest of §1.1). This is allowed: the requirement is that `code` be *stable and machine-readable within a service*, not that every service share one vocabulary — a client already scopes its branching by which service answered, so two services never need to compare `code` values against each other directly. §1.3's table remains the *recommended* starting vocabulary for a service with no existing one of its own (i.e. new services via the M6 template), not a mandate to remap an established one. Per the same ruling, **`utility`** now mixes both within one service: every error that predates the bucket registry still answers with this table's SCREAMING_CASE values, while the new bucket-registry and presign routes contribute their own lowercase snake_case codes (`bucket_not_allowed`, `bucket_not_found`, `invalid_path`, `bucket_exists`, …) via a `DomainError::Coded` variant chosen at the call site — an addition alongside the table, not a remap of it (`maxgame-utility-server/src/inbound/error.rs`, `src/domain/error.rs`; pinned by its own `platform_conformance.rs`).
 
 ### 1.4 Non-conformance found and fixed during M2/M3
 
@@ -313,12 +313,20 @@ not rename or drop `status`**, and on the 503 branch must not drop
 `dependency`. Three sanctioned additions exist today, kept deliberately
 rather than converged away:
 
-- **`utility`** answers `{"status": "ready", "buckets": N}` on `/readyz`
-  and has **no 503 branch at all** — it has no runtime dependency to fail
-  against (an empty bucket registry refuses to boot, so a started replica
-  always has *a* registry), so `buckets` is the entire readiness signal: the
-  count is how a rolling deploy shows a replica still running a stale
-  `R2_BUCKETS`. Source: `maxgame-utility-server/src/inbound/health.rs`.
+- **`utility`** gained a Postgres dependency: the bucket registry (`public_base_url`
+  + active/disabled status per bucket) now lives in its own `utility` database,
+  behind the fleet's usual pgcat pool — R2 credentials/connection details stay
+  in env, unchanged. `/readyz` now answers
+  `{"status": "ready", "database": "ok", "buckets": N, "r2Credentials": {...}}`
+  and **does have a 503 branch**: `database: "unavailable"` when Postgres is
+  unreachable — a replica that can't reach the registry answers
+  `bucket_not_found` for every upload, so it must drain rather than keep
+  taking traffic. `buckets` keeps its original, narrower meaning (the count
+  of buckets this replica holds R2 *credentials* for, from env
+  `R2_BUCKETS` — a stale-config signal, unrelated to how many bucket rows
+  exist in the DB registry); `r2Credentials` reports whether those
+  credentials were proven to work by the boot-time R2 probe. Source:
+  `maxgame-utility-server/src/inbound/health.rs`.
 - **`authServer`** keeps `postgres_write`/`postgres_read`/`redis` on
   `/readyz` alongside the standard `status`/`dependency` keys, deliberately,
   for backward compatibility with a production deployment that already
@@ -750,7 +758,7 @@ nests its whole router under it (axum `Router::nest(base_path, app)`).
 | `/launcher` | `launcher` | `maxgame-launcher-backend` |
 | `/news` | `news` | `maxgame-news-backend` |
 | `/web` | `web` | `maxgame-web-backend` |
-| `/utility` | `utility` | `maxgame-utility-server` |
+| `/utility` | `utility` | `maxgame-utility-server` (also mounts the bucket registry admin CRUD — `POST/GET /v1/admin/buckets`, `GET /v1/admin/buckets:active`, `GET/PATCH/DELETE /v1/admin/buckets/{id}`, super_admin only) |
 | `/platform` | `api` | `web-platform-backend` (temporary — strip-prefix at the ingress instead of a code change, since this service is being retired) |
 | `/mailer` | `mailer` | `maxgame-mail-server` (the Rust port of `maxgame-email-server-legacy`; port 8096, `BASE_PATH=/mailer`, no ingress rewrite. Replaces the old "stays on Cloud Run" row — the Node service on `mailer.*` is retired at cutover. See its exceptions in §1.5 and §2.4) |
 
