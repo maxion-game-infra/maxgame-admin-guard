@@ -315,18 +315,22 @@ rather than converged away:
 
 - **`utility`** gained a Postgres dependency: the bucket registry (`public_base_url`
   + active/disabled status per bucket) now lives in its own `utility` database,
-  behind the fleet's usual pgcat pool — R2 credentials/connection details stay
-  in env, unchanged. `/readyz` now answers
+  behind the fleet's usual pgcat pool. Since dev-v0.3.0 the env carries a
+  single account-scoped R2 credential (`R2_ACCOUNT_ID`/`R2_ACCESS_KEY_ID`/
+  `R2_SECRET_ACCESS_KEY`; a leftover `R2_BUCKETS` is warn-ignored), so a
+  registered+active row is immediately signable. `/readyz` answers
   `{"status": "ready", "database": "ok", "buckets": N, "r2Credentials": {...}}`
   and **does have a 503 branch**: `database: "unavailable"` when Postgres is
   unreachable — a replica that can't reach the registry answers
   `bucket_not_found` for every upload, so it must drain rather than keep
-  taking traffic. `buckets` keeps its original, narrower meaning (the count
-  of buckets this replica holds R2 *credentials* for, from env
-  `R2_BUCKETS` — a stale-config signal, unrelated to how many bucket rows
-  exist in the DB registry); `r2Credentials` reports whether those
-  credentials were proven to work by the boot-time R2 probe. Source:
-  `maxgame-utility-server/src/inbound/health.rs`.
+  taking traffic. `buckets` counts the registry's ACTIVE rows (identical on
+  every replica; `0` also when the registry itself was unreadable — the
+  `database` field disambiguates); `r2Credentials` reports the boot-time
+  probe of each active registered bucket with the single credential, and
+  flips readiness to 503 only when the credential works against NO
+  registered bucket at all — one `ok: false` bucket is a bad registry row,
+  stays visible in the body, and does not fail readiness. Source:
+  `maxgame-utility-server/src/inbound/health.rs`, `src/adapters/r2_probe.rs`.
 - **`authServer`** keeps `postgres_write`/`postgres_read`/`redis` on
   `/readyz` alongside the standard `status`/`dependency` keys, deliberately,
   for backward compatibility with a production deployment that already
