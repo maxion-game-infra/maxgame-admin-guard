@@ -847,7 +847,25 @@ belongs to exactly one tier:
    audit trail** between fleet members calling each other this way — the
    platform philosophy (per the design doc) is that communication *inside*
    the fleet should be as simple as possible: no key issuance, no key
-   rotation, no verify round-trip, nothing to audit.
+   rotation, no verify round-trip, nothing to audit. Concrete instances
+   today: `maxgame-auth-server` exposes `GET /internal/v1/games`, called by
+   `maxgame-launcher-backend` (§6.4's retired-`ADMIN_API_KEYS` row). This
+   plan (2026-08-24) adds a second route at the same path —
+   `GET /internal/v1/games[?channel=dev|sit|uat|staging|prod]` — on
+   `maxgame-launcher-backend` itself: same path, two different services,
+   and deliberately **different response bodies** (shape documented in
+   that repo's own README, not here — this contract doesn't own it), so no
+   caller may point one route's deserializer at the other's response. That
+   makes `maxgame-launcher-backend` a tier-2 callee as well as a tier-2
+   caller. **Reserved status strings:** a tier-2 route that reports another
+   service's status verbatim must be able to say "I could not ask" and "it
+   answered, and has no such record" as answers distinct from any real
+   value. `unknown` and `unregistered` are therefore reserved fleet-wide for
+   exactly those two meanings and no service may emit either as a genuine
+   status of its own — `maxgame-auth-server`'s game status is `active` /
+   `disabled` (validated on write, `src/application/services/game.rs`), so
+   adding either reserved word there would silently merge "it said so" with
+   "we could not ask" at every consumer that forwards it.
 3. **A server outside the platform** — cloud functions, partners, external
    CI. `mxs_...` key-server key + `POST /v1/verify` (§6.1, unchanged).
    **Repositioning:** key-server is now exclusively the credential for this
