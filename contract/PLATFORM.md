@@ -10,7 +10,9 @@ a version bump this document can force.
 
 Scope: the eight admin-facing services behind `web-platform-back-office`.
 Player-facing / non-admin surfaces (e.g. `maxgame-auth-server`'s player API)
-are out of scope except where they double as an admin surface.
+are out of scope except where they double as an admin surface, or where a
+claim on a player token needs a fleet-wide, verifiable contract of its own —
+see §8.
 
 | Key | Service | Repo |
 |---|---|---|
@@ -1338,6 +1340,29 @@ section rather than assuming every bullet below applies unmodified.
 - [ ] Swagger/`OPENAPI_ENABLED` gap — see §3.5's "Known gap" note. Real,
       still open, and no longer excused by a live-production-deployment
       reason now that FROZEN is lifted.
+- [ ] Player step-up claims (§8, plan
+      `2026-08-20-player-mfa-totp-stepup.md`): a token minted by
+      `POST /v1/auth/mfa/verify` carries `amr`, `acr`, and `auth_time`
+      (§8.1); a token minted by `POST /v1/auth/refresh` carries **none** of
+      the three, regardless of whether the token being refreshed was aal2
+      (§8.3 — refresh always returns aal1).
+- [ ] Every platform player token (launcher/web/shop surfaces) carries the
+      `mfa` claim (`{enabled, methods}`, §8.1); the game-token mint path
+      (`launch.rs`) carries none of the four §8.1 claims.
+- [ ] `POST /v1/auth/introspect` (internal callers, and external `mxs_`
+      callers per §6.5) mirrors `amr`/`acr`/`auth_time`/`mfa` exactly as
+      they appear on the presented token — token-literal, not a live
+      `GET /v1/me/mfa` lookup (§8.4).
+- [ ] 401 challenge shape (§8.2): `authServer` mints step-up tokens and
+      issues elevation, but does not itself gate any route on aal2 — there
+      is no marketplace/transfer-style resource in this repo, so its own
+      conformance test has nothing here to assert against a live route.
+      The `WWW-Authenticate: Bearer error="insufficient_user_authentication",
+      acr_values="aal2", max_age=<seconds>` shape is still normative
+      platform-wide and is enforced (and tested) by whichever resource
+      server actually gates on elevation — e.g. `example-mfa`'s BFF — not
+      by this repo. Listed here only so a reader of this checklist doesn't
+      mistake the absence of a bullet for a missed obligation.
 
 **SPA (`web-platform-back-office`, M4 — not a Rust repo, listed for
 completeness)**
@@ -1353,3 +1378,167 @@ completeness)**
 - [ ] e2e preflight: every `FEATURE_KEYS` entry is a subset of
       `GET /api/v1/sites`'s live catalog (subset, not equality — the catalog
       legitimately has keys the SPA has no route for).
+
+---
+
+## 8. Player step-up authentication (MFA)
+
+**Scope note, read before the rest of this section.** Everything above this
+line is about the *admin* JWT — issued by `idp`, verified per the
+eight-rule contract at `contract/README.md` (§4). This section is about a
+different token: the **player** access token issued by `maxgame-auth-server`
+(the fleet table's `authServer` row, "Player IdP"). It is the one deliberate
+carve-in against this document's own scope line (top of file), added because
+`POST /v1/auth/introspect` on `authServer` is already a live table entry
+here (§6.5, tier-3 external-caller roster) — the claims that route now
+mirrors belong next to the route itself, not split into a second document.
+Everywhere below, "token" means the player access token, never the admin
+JWT, unless stated otherwise.
+
+Source for every claim, decision, and citation in this section:
+`back-office-workspace/.omc/plans/2026-08-20-player-mfa-totp-stepup.md`
+(decisions D1-D17) — file:line references below are copied from that plan's
+own evidence, since the code they describe lands alongside this document
+rather than before it. Integration tutorials for consumers live in
+`example-mfa`'s README, not here; this section is the claim/challenge
+contract, not a walkthrough.
+
+### 8.1 Four new claims on the player `AccessClaims`
+
+| Claim | Type | Present on | Meaning |
+|---|---|---|---|
+| `amr` | `string[]` | tokens minted by step-up verify only | RFC 8176 authentication-methods-reference; TOTP verification reports `["otp"]` |
+| `acr` | `string` | tokens minted by step-up verify only | authentication-context-class-reference (OIDC / RFC 9470's `acr_values` convention); the only value this platform mints today is `"aal2"` — absence means aal1, there is no explicit aal1 marker |
+| `auth_time` | `number` (unix seconds) | alongside `acr` only, never alone | when the MFA ceremony completed |
+| `mfa` | `{enabled: bool, methods: string[]}` | every platform player token (launcher/web/shop surfaces) | enrollment state — independent of whether *this* token is aal1 or aal2 |
+
+All four are optional on the wire (omitted, not null, when absent):
+`maxgame-auth-server/src/application/ports/mod.rs:35-48` (`AccessClaims`),
+same `skip_serializing_if` precedent as that struct's existing `tenant`/
+`acct` fields.
+
+**`mfa` is a UI hint. It must never be an input to an authorization
+decision.** A resource may use it to decide whether to *show* an "enable
+MFA" prompt; it must not use it to decide whether to *require* aal2 —
+enforcement always reads `acr`/`auth_time` off the token in hand (§8.3),
+never `mfa.enabled`. Two reasons this has to hold: `mfa` reflects enrollment
+state as of whenever the token was minted, and every player token can be
+stale relative to live enrollment state for up to the access TTL (900s,
+`config/mod.rs:308`) plus the verifier's clock leeway (60s,
+`adapters/token.rs:32,65`); and a resource that gated on `mfa.enabled`
+instead of `acr` would let a player who just enrolled skip re-authenticating
+on a token minted before enrollment.
+
+`launch.rs:337-348`'s game-token mint path carries none of these four claims
+— game tokens are untouched by this section entirely (plan D3).
+
+### 8.2 Step-up challenge: 401 + `WWW-Authenticate` (RFC 9470)
+
+A resource that requires elevation for a given request, and finds the
+presented token below that bar, answers:
+
+```
+401
+WWW-Authenticate: Bearer error="insufficient_user_authentication", acr_values="aal2", max_age=<seconds>
+```
+
+**New fleet rule, amending the existing one:** every client consuming a
+player-token-protected resource — the back office wherever it touches
+player data, `example-mfa`'s BFF, any future consumer — **must read
+`WWW-Authenticate` before deciding what a 401 means.** A 401 carrying
+`error="insufficient_user_authentication"` is a step-up prompt, not a
+refresh-and-retry signal; treating it as the latter burns a refresh (and,
+per §8.3, discards elevation on the resulting token) for no benefit, then
+fails again identically. This *narrows* the fleet's existing "every 401
+triggers a refresh" convention rather than replacing it: a 401 with no
+`WWW-Authenticate` header, or one that doesn't name
+`insufficient_user_authentication`, is still the old case and still
+triggers refresh exactly as before.
+
+### 8.3 Verification
+
+Every resource verifies the player token the way §4 verifies admin JWTs —
+offline via JWKS (EdDSA), `iss`/`aud`/`alg`/`exp` enforced — plus one
+additional check on a route that requires elevation:
+
+```
+acr == "aal2"  AND  now - auth_time <= max_age
+```
+
+**Never `acr` alone.** Token verification already carries a 60s leeway
+(§8.1), so a token can pass signature/expiry checks briefly outside its true
+issue window; pinning freshness to `auth_time` rather than trusting `acr`'s
+bare presence is what stops a stale-but-not-yet-expired aal2 token from
+granting elevation past the caller's intended `max_age`.
+
+To obtain a fresh elevation: `POST {auth-server}/v1/auth/mfa/verify` (bearer
+aal1 token + `{method, code}`) returns a new access token carrying all four
+§8.1 claims, on the same `sid` — session identity is unchanged, only the
+token is reissued.
+
+**Error semantics on this endpoint (plan D17, D11):**
+
+- Wrong code, no active method, and no enrollment at all are three
+  distinct causes that all answer **400 `{"error": "invalid_mfa_code"}`**,
+  indistinguishable in both shape and timing — a caller must not be able
+  to tell "you have no MFA enrolled" from "your code is wrong" (plan D17's
+  enumeration-resistance rule, applied to this endpoint's whole response).
+- Lockout and rate-limiting both answer **429 with `Retry-After`** (§3.6
+  rule 1); an enrolled player and a non-enrolled player must reach 429 at
+  the same attempt count, for the same enumeration-resistance reason as
+  the 400 case above.
+- An unsupported `method` value (e.g. a future passkey method requested
+  before it ships) answers **400 `{"error": "validation_failed"}`** — a
+  different `error` value from the `invalid_mfa_code` case above, since
+  this is a caller bug, not an authentication outcome, and doesn't need
+  the same enumeration-resistance treatment.
+- A banned player answers **403 `{"error": "player_banned"}`**, via the
+  same `check_ban` gate `POST /v1/auth/refresh` already applies (plan
+  D17) — a correct code does not lift a ban.
+- **This endpoint never answers 401 for a rejected code — 401 here means
+  only that the bearer token itself is invalid** (expired, bad signature,
+  wrong `iss`), never a wrong or missing MFA code. A client that applied
+  the fleet's ordinary "401 → refresh/logout" convention (amended for
+  step-up challenge 401s by §8.2, but still the default everywhere else)
+  to a wrong-code response would kill a live session over one mistyped
+  TOTP digit instead of letting the player try again. This is the easiest
+  mistake for a new consumer to make on this specific endpoint, precisely
+  because a dead session and a rejected code both read as "the attempt
+  failed."
+
+**Refresh always returns aal1.** `POST {auth-server}/v1/auth/refresh` mints
+its claims from the session row alone (`mint_pair`,
+`auth.rs:687,705`) and never carries `amr`/`acr`/`auth_time`, regardless of
+whether the token being refreshed was aal2 — elevation is a property of the
+token, not the session, specifically so a session cannot leak elevation
+across a refresh: this repo's grace-replay path forks a second token from
+one refresh call (`auth.rs:669-682`), and if elevation lived on the session
+row instead of the token, both forks would inherit it. A client that
+proactively refreshes mid-flow should expect elevation to disappear and
+re-challenge — that is the designed behaviour, not a bug to work around.
+
+### 8.4 Introspect mirrors the token, verbatim
+
+`POST /v1/auth/introspect` (internal callers, and external `mxs_` callers
+per §6.5's `authServer` row, scope `accounts:introspect`) returns
+`amr`/`acr`/`auth_time`/`mfa` exactly as they appear on the token presented
+— `IntrospectResult` (`auth.rs:80-90`) gains the same four fields, optional,
+token-literal rather than a live lookup. A caller that needs *current*
+enrollment state rather than what a specific token was minted with must call
+`GET /v1/me/mfa` instead; introspect answering anything else would make it a
+second, inconsistent source of truth for the exact fact §8.1 already warns
+against trusting.
+
+### 8.5 Reserved, not implemented
+
+Two extension points are named here so a later implementation doesn't have
+to invent a name this document would then need to reconcile against:
+
+- `acr_values` / `max_age` parameters on the player OAuth broker's
+  `authorize` endpoint (`maxgame-auth-server`) — full RFC 9470, challenging
+  the login ceremony itself rather than only post-login step-up.
+- Additional `amr` values for methods beyond TOTP's `"otp"` — passkey is
+  next in scope. §8.1's claim shape already accepts any string, so a new
+  method needs no schema change, only a new registered value.
+
+Neither exists in `maxgame-auth-server` today.
