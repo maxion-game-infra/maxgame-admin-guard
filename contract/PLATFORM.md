@@ -837,10 +837,21 @@ belongs to exactly one tier:
    ClusterIP service has no path in from outside the cluster, and the one
    rule every gateway must hold without exception is **`/internal/` must
    never appear in any ingress, on any path, ever.** The platform gateway
-   is an explicit path allowlist it controls; `maxgame-auth-server`'s own
-   ingress is an allowlist regex (`maxgame-dev-gitopt/workloads/gateway/
-   ingress-auth-server.yaml`) — both keep excluding this prefix by
-   construction, not by omission, and both carry a comment saying so. A
+   is an explicit path allowlist it controls
+   (`maxgame-dev-gitopt/workloads/gateway/ingress.yaml`), which excludes this
+   prefix by construction rather than by omission and carries a hard-rule
+   comment saying so for every service in it, present and future. **Corrected
+   2026-08-24:** this paragraph previously also cited a per-service
+   `workloads/gateway/ingress-auth-server.yaml` as a second allowlist. No such
+   file exists — `workloads/gateway/` holds only `ingress.yaml`, and
+   `workloads/maxgame-auth-server/` has no Ingress of its own — so the single
+   gateway allowlist is the whole of the enforcement. Naming a control that
+   does not exist is worse than naming none: it invites a reader to assume a
+   second line of defence is in place. Note also that no `NetworkPolicy` exists
+   anywhere in that repo today, so "inside the cluster" is one flat trust zone
+   and every pod in it — including internet-facing ones in `playground` — can
+   reach every `/internal/*` route. That is the tier-2 model as designed, not a
+   defect, but it is the reason the ingress allowlist has to hold absolutely. A
    caller may send
    `X-Internal-Caller: <service-name>` as a debug courtesy; the callee logs
    it if present but never verifies it, and there is deliberately **no
