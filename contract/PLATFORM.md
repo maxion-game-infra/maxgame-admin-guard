@@ -877,6 +877,23 @@ belongs to exactly one tier:
    `disabled` (validated on write, `src/application/services/game.rs`), so
    adding either reserved word there would silently merge "it said so" with
    "we could not ask" at every consumer that forwards it.
+   **Channel is part of game-account identity (2026-08-27).** `maxgame-auth-server`
+   derives `account_id` as `BLAKE3(player_id ‖ tenant ‖ channel ‖ slot_index)`, so
+   a tenant plus a slot no longer names an account — the deployment lane is part of
+   the key. Three wire shapes changed with it and any tier-2 caller reading them
+   must expect the new field: `GET /v1/me/accounts` and
+   `GET /internal/v1/players/{player_id}/accounts` now name each slot's `channel`,
+   and a game JWT carries a `channel` claim beside `tenant`/`acct`.
+   The claim is **descriptive, not authoritative** — `acct` already binds the
+   channel by hashing it, so a verifier must never prefer the claim over the
+   account id it accompanies.
+   `channel` is one of `dev | sit | uat | staging | alpha | beta | prod`, and it is
+   **required, never defaulted**, on every route that reaches the derivation: a
+   caller that omits it gets a 400 rather than a silent write to `prod`. The
+   read side mirrors this — `GET /v1/games/{tenant}/accounts` requires
+   `?channel=`, because a dev build and a prod build share a tenant and an
+   unscoped read would hand back another lane's characters.
+
 3. **A server outside the platform** — cloud functions, partners, external
    CI. `mxs_...` key-server key + `POST /v1/verify` (§6.1, unchanged).
    **Repositioning:** key-server is now exclusively the credential for this
