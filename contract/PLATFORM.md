@@ -904,6 +904,64 @@ belongs to exactly one tier:
    tier-3-facing surfaces (partner uploads, external CI, the team-facing
    mail API), not fleet-internal calls.
 
+   **`/v1/external/*` — a second tier-3 prefix, added 2026-08-27.** Beside
+   the existing `/v1/partner/*` (utility's presign-upload), tier 3 now has a
+   second route namespace, and the two are not interchangeable: `partner` is
+   a write surface for a named commercial partner (utility mints presigned
+   R2 upload URLs for it), while `external` is a read surface any
+   key-holding app may call — no partner relationship implied, just
+   possession of a key carrying the right scope. Concretely:
+   `maxgame-auth-server`'s `GET /v1/external/games`,
+   `GET /v1/external/players/{player_id}` and
+   `GET /v1/external/players/{player_id}/accounts`; `maxgame-launcher-backend`'s
+   `GET /v1/external/games?channel=`. Both prefixes remain the same tier
+   described above — `mxs_` key, `POST /v1/verify` — the prefix only signals write-vs-read intent to
+   whoever has to decide which namespace a future route belongs under. One
+   rule here departs from every tier-2 route reading the same
+   underlying data: on `/v1/external/*`, a **404 answers both "no such
+   player" and "a player this key may not see"** (i.e. outside the caller's
+   `metadata.tenants`, where the route requires it). Answering 403 for the
+   second case would confirm the `player_id` exists at all, handing an
+   external caller an enumeration oracle over the whole player base — the
+   exact thing tenant-scoping these routes exists to prevent. This is a
+   deliberate divergence from the `/internal/*` twins, whose 404 means only
+   "unknown player" — a future service must not "fix" `/v1/external/*` back
+   onto that narrower meaning.
+
+   **CORS on tier-3, stated as it actually is (corrected 2026-08-27).** An
+   earlier draft of this paragraph claimed "no browser CORS on either
+   prefix". That was false when written: `utility`'s `/v1/partner/*` has
+   always sat inside its CORS layer and explicitly allow-lists the partner
+   credential header, and `maxgame-launcher-backend`'s external route
+   inherited its service-wide CORS layer on the day it was added. Only
+   `maxgame-auth-server` merges its external group past `build_cors`. The
+   rule that is true, and the one to hold: **no origin may be added to any
+   CORS allowlist on account of a tier-3 route.** A tier-3 route is
+   server-to-server; a browser-reachable one holding an `mxs_` key means the
+   key is sitting in a browser, which is the thing to prevent — and CORS is a
+   read grant, not what makes a route callable, so an inherited CORS layer is
+   untidy rather than an authentication hole. Where a service can cheaply
+   exclude its tier-3 group from CORS it should, so the untidiness cannot
+   later be mistaken for a licence.
+
+   **A case-insensitive authorization comparison is safe only where the
+   identity space is normalized at write time.** Recorded here because this
+   platform has already made the mistake once, in the same wave that added
+   these routes. `utility`'s `may_use_bucket` compares bucket grants with
+   `eq_ignore_ascii_case`, which is correct *there* — bucket names are
+   lowercased on registration, so two case-distinct buckets cannot exist and
+   the looseness grants nothing extra. That predicate was then copied into
+   `maxgame-auth-server`'s `may_see_tenant`, **along with the comment
+   asserting the precondition** — but `game.tenant` is an unnormalized
+   `TEXT PRIMARY KEY` with an exact lookup, so two case-distinct tenants can
+   exist and the identical predicate became a privilege widening: a key
+   granted one tenant was authorized for the other. The mechanism travelled;
+   the precondition that made it safe did not, and the copied comment made
+   the code read as correct to a reviewer. Before reusing any grant-matching
+   predicate, check whether the identity it matches against is canonical at
+   write time. If it is not, compare exactly, and put typo-tolerance at
+   issue time where a mistake produces an error instead of a wider grant.
+
 ### 6.1 Request / response
 
 ```json
@@ -911,6 +969,17 @@ belongs to exactly one tier:
 // header: x-verifier-service: <caller's own name>   (never send the key in a header, only the body)
 { "key": "mxs_...", "required_scopes": ["utility:partner-upload"] }
 ```
+
+**`x-verifier-service` has no agreed convention today, and it is worth knowing
+before you grep for one.** It is log-correlation only — key-server puts it in a
+tracing span and nothing branches on it — so the inconsistency has cost nothing
+so far, but a fleet-wide search for one form silently misses the others. The
+live values, read from each service's `VERIFIER_SERVICE` constant on
+2026-08-27: `maxgame-auth-server`, `maxgame-utility-server` and
+`maxgame-mail-server` send their **repo name**; `launcher` and `admin-auth`
+send their **gateway path name**. Pick either convention for a new service, but
+say which one you followed, and do not assume a row in §6.5 below records the
+value correctly — one of them did not until this date.
 
 Always answers **200** — this is possession-based verification, not
 authorization by HTTP status. The `active` field is what a caller branches
@@ -992,9 +1061,10 @@ answering 307/308 and asserts the redirect target receives nothing.
 ### 6.3 Scope catalog
 
 ```
-idp:introspect             accounts:introspect        launcher:release-upload
-launcher:coupon-pipeline   email:send                  cs:jobs
-utility:partner-upload
+idp:introspect            accounts:introspect  launcher:release-upload
+launcher:coupon-pipeline  email:send           cs:jobs
+utility:partner-upload    accounts:games-read  accounts:player-accounts-read
+accounts:player-read      launcher:games-read
 ```
 
 Every scope is prefixed with the service that actually enforces it
@@ -1013,10 +1083,25 @@ themselves retired (see §6.4). `accounts:introspect` was added the same day
 (a second 2026-08-17 change, after the reduction to 6) so `maxgame-auth-server`
 — the player IdP, whose gateway path is `/accounts` — can gate its own
 `POST /v1/auth/introspect` to tier-3 external callers holding an `mxs_` key,
-bringing the catalog to 7; see §6.5 for the consumer.
+bringing the catalog to 7; see §6.5 for the consumer. Extended from 7 to 11
+on 2026-08-27 for the `/v1/external/*` tier-3 read surface (§6.0, point 3):
+`accounts:games-read`, `accounts:player-accounts-read` and
+`accounts:player-read`, all enforced by `maxgame-auth-server`; and
+`launcher:games-read`, enforced by `maxgame-launcher-backend` — the first
+scope that service enforces, making it a tier-3-facing service for the
+first time (identity mapping and consumer env set to follow in §6.5/§6.6
+once that service's key-server integration lands).
 
-Source: `maxgame-key-server/src/domain/scopes.rs` (`SCOPE_CATALOG`) —
-the live, enforced list (`is_known_scope`).
+Source: `maxgame-key-server/src/domain/scopes.rs` (`SCOPE_CATALOG`) — the
+live, enforced list (`is_known_scope`). The shape test there
+(`catalog_has_no_platform_prefix_and_matches_service_action_shape`) was
+tightened the same day (2026-08-27): it previously split each scope on the
+first `:` only, so a three-part name like `accounts:games:read` would have
+passed unnoticed — exactly the shape `authserver:games:read` had, above,
+before it was deleted, with nothing at the time stopping a similar name
+from coming back. The test now also asserts the action half contains no
+further `:`, so the two-part `<service>:<action>` convention is enforced,
+not merely observed.
 
 ### 6.4 Legacy S2S secrets registry (not migrated by this plan)
 
@@ -1050,8 +1135,12 @@ qualifies.
 |---|---|---|---|
 | `mailer` (`maxgame-mail-server`) | `POST /v1/emails:send`, `GET /v1/jobs/{id}` (both behind `require_team`) | `email:send` | `key_id` → stored **unprefixed** in `jobs.key_id` and the audit trail. Before Phase 4 of the mail-server key consolidation (2026-08-18) this was stored as `mxs:{key_id}`, prefixed to keep it from colliding with this service's own `api_keys.id` — Phase 4 dropped that table outright, so there is only one id namespace left and nothing to disambiguate · `team_name` → verify's `consumer`, which `modules::jobs_get`'s ownership check compares instead of `key_id` since Phase 4 (a rotated key gets a new `key_id` but keeps the same `consumer`) · `allowed_senders` → verify's `metadata.allowed_senders` (array of sender-id strings), **explicit only**: no `metadata`, no `allowed_senders` field, or an empty array all mean **no senders**, never "every sender". `/v1/verify` has no sender concept of its own — `metadata` is free-form — so this mapping is the only place enforcing the "empty means none, not all" rule an `email:send` key would otherwise bypass entirely, turning one key into the ability to impersonate every sender the service knows about. Source: `maxgame-mail-server/src/adapters/key_server.rs` (`VerifiedServiceKey::allowed_senders`) and `src/infrastructure/team_auth.rs` (`verify_via_key_server`). `mxs_`-only as of Phase 4 (2026-08-18) — the legacy per-tenant `mxk_live_…` bearer key this row used to dual-accept alongside `mxs_` was retired outright, not kept as a fallback. |
 | `utility` (`maxgame-utility-server`) | `POST /v1/partner/presign-upload` | `utility:partner-upload` | `metadata.buckets` (array of bucket-name strings) → which R2 bucket(s) the key may presign into, **explicit only** same as `mailer`'s sender rule — absent/empty/non-array grants no bucket, never every bucket (`VerifiedServiceKey::may_use_bucket`). `mxs_`-only — no legacy credential form on this route. Source: `maxgame-utility-server/src/adapters/key_server.rs`, `src/infrastructure/service_key_auth.rs`. |
-| `authServer` (`maxgame-auth-server`) | `POST /v1/auth/introspect` | `accounts:introspect` | Possession-only gate: a valid key with the scope unlocks the route, the verify response otherwise isn't mapped onto anything — the route's own answer is the introspection result for the player access token in the request body, unrelated to the key's `key_id`/`consumer`/`metadata`. `mxs_`-only — this route carries no legacy shared secret to fall back to. Added 2026-08-17 (this plan) so external callers can introspect player tokens without a fleet-internal `/internal/*` hop; `x-verifier-service: auth-server`. Source: `maxgame-auth-server/src/adapters/key_server.rs`, `src/infrastructure/service_key_auth.rs`. |
+| `authServer` (`maxgame-auth-server`) | `POST /v1/auth/introspect` | `accounts:introspect` | Possession-only gate: a valid key with the scope unlocks the route, the verify response otherwise isn't mapped onto anything — the route's own answer is the introspection result for the player access token in the request body, unrelated to the key's `key_id`/`consumer`/`metadata`. `mxs_`-only — this route carries no legacy shared secret to fall back to. Added 2026-08-17 (this plan) so external callers can introspect player tokens without a fleet-internal `/internal/*` hop; `x-verifier-service: maxgame-auth-server`. Source: `maxgame-auth-server/src/infrastructure/adapters/key_server.rs`, `src/interface/middleware/service_key.rs`. *(Corrected 2026-08-27: this row previously gave the header value as `auth-server`, which no service sends, and named two source files that do not exist — `src/adapters/key_server.rs` and `src/infrastructure/service_key_auth.rs`. Both were wrong from the day the row was written.)* |
 | `idp` (`maxgame-admin-auth-server`) | `POST /api/v1/oauth/introspect` | `idp:introspect` | Same possession-only gate as `authServer` above — verify only unlocks the route, the introspection result comes from the admin access token in the request body. **Dual-accept**: a credential starting with `mxs_` is verified via key-server; anything else falls back to a constant-time compare against the legacy shared `INTROSPECT_API_KEY`, with **no cross-fallback either direction** — an `mxs_` key that fails verification is never retried against the shared secret. Added 2026-08-17 (this plan) so external callers no longer need the shared secret every fleet member also holds; `x-verifier-service: admin-auth`. `KEY_SERVER_BASE_URL` is optional here (unlike the other rows) — unset disables only the `mxs_` path, so a deploy-order mistake can't take down the shared-key path every mutation in the fleet depends on. Source: `maxgame-admin-auth-server/src/adapters/key_server.rs`, `src/infrastructure/api_key.rs`. |
+| `authServer` (`maxgame-auth-server`) | `GET /v1/external/games` | `accounts:games-read` | **Possession-only** — the same shape as `accounts:introspect` above: a valid, unrevoked key carrying the scope unlocks the route, and the verified key's `metadata` is not read at all. Nothing about the game catalog varies by caller, so there is nothing to scope it by; the body is `GameService::admin_list()` verbatim, the same one `GET /v1/admin/games` and `GET /internal/v1/games` serve. `mxs_`-only — this route carries no legacy credential form. Added 2026-08-27 (external API tier-3 plan, `/v1/external/*`, §6.0 point 3). Source: `maxgame-auth-server/src/interface/routes/external.rs::games`. |
+| `authServer` (`maxgame-auth-server`) | `GET /v1/external/players/{player_id}/accounts` | `accounts:player-accounts-read` | `metadata.tenants` (`VerifiedServiceKey::granted_tenants`), **explicit only** — the same fail-closed shape as `mailer`'s `allowed_senders` and `utility`'s `buckets` above: **absent `metadata`, absent `tenants`, an empty array, or a non-array all mean no tenant, never every tenant.** A non-string entry sitting beside good ones in the array is dropped rather than voiding the rest; each string entry is trimmed, so a whitespace-only entry (e.g. `" "`) is dropped the same way an empty string is, and `" mu-maxage "` grants exactly `mu-maxage`. Tenant matching is **exact** — byte equality, no case folding of any kind. It has to be, and the reason is the rule stated in §6.0 above: `game.tenant` is an unnormalized `TEXT PRIMARY KEY` looked up with `=`, so two tenants differing only in case are two different games, and a comparison looser than the identity would authorize a key granted one to read the other. **This row briefly said the opposite.** Between 2026-08-27's first and second passes the comparison was `eq_ignore_ascii_case`, copied from `utility`'s `may_use_bucket` — safe *there*, because bucket names are lowercased at registration, and a privilege widening *here*, because tenants are not. A mistyped tenant therefore now grants **nothing** rather than something wider; typo-tolerance belongs at issue time, where the back office validates the value against the live tenant list and the operator gets an error instead of a broader key. A key naming **no** usable tenant answers **403**, once, at the gate, rather than 200-with-nothing — a statement about the caller's own misconfiguration, not about any player, so it costs nothing to say plainly and saves the key's owner a debugging session. A key that does name a usable tenant sees only the accounts held in it; a player who holds none of them answers **404**, byte-identical to a `player_id` that does not exist at all — see §6.0's 404-collapse rule, which this row inherits rather than restates. `mxs_`-only. Added 2026-08-27. Source: `maxgame-auth-server/src/infrastructure/adapters/key_server.rs` (`VerifiedServiceKey::granted_tenants`, `may_see_tenant`, `has_any_tenant`), `src/interface/routes/external.rs` (`visible_accounts`). |
+| `authServer` (`maxgame-auth-server`) | `GET /v1/external/players/{player_id}` | `accounts:player-read` | Same `metadata.tenants` gate, same fail-closed reading, and the same 403/404 split as the row above — this route calls the identical `visible_accounts` predicate, which is what guarantees it can never be more permissive about *who* is visible than the accounts-list route is. Additionally gated on `metadata.pii` (`VerifiedServiceKey::may_see_pii`), **default deny**: **only a literal JSON `true` releases the full payload — absent, `false`, `"true"`, `1`, and every other non-boolean shape all mean the trimmed one.** What `pii: true` unlocks is the player's email address and their Google account id (`links[].provider_account_id`). The trimmed payload (`ExternalPlayerView`) is a **distinct struct that structurally cannot carry either field**, not `MeResult` re-used with a `skip_serializing_if` attribute — an attribute is one careless edit away from leaking the field it hides, whereas a type with no `email` field cannot serialize one no matter what is later done to it. `mxs_`-only. Added 2026-08-27. Source: `maxgame-auth-server/src/infrastructure/adapters/key_server.rs` (`VerifiedServiceKey::may_see_pii`), `src/interface/routes/external.rs` (`ExternalPlayerView`, `ExternalPlayerResponse`). |
+| `launcher` (`maxgame-launcher-backend`) | `GET /v1/external/games?channel=` | `launcher:games-read` | **Possession-only**, the same shape as `accounts:games-read` above: the catalog is the same for every holder, so the verified key's `metadata` is not read. The body is `games_catalog(...)` verbatim — the same function `GET /internal/v1/games` calls — so the two routes cannot answer differently about the data; they differ only in who may ask. `mxs_`-only. Added 2026-08-27. **This is the first scope `maxgame-launcher-backend` enforces, and it makes the service tier-3-facing for the first time.** Before this it was tier-2 only, in both directions §6.0 already describes: a *caller* (its own auth-server join over `/internal/v1/games`) and, since the 2026-08-24 plan, a *callee* (`GET /internal/v1/games` served to fleet-mates with no credential at all). That tier-2 route is untouched by this row — the tier-3 route is a gated twin sitting in front of the same handler body, not a replacement for it. Source: `maxgame-launcher-backend/src/adapters/key_server.rs`, `src/modules/external/mod.rs`. |
 
 Error taxonomy, same as §6.2 with one addition worth naming explicitly: a
 verdict of `active: false` (any of the four `reason` values in §6.1) is a
@@ -1061,6 +1150,15 @@ never an implicit pass and never a fallback to the legacy credential form.
 `mailer`'s reference tests: `an mxs key with no metadata.allowed_senders is
 refused`, `an mxs key listing a different sender is refused`, `a rate-limited
 verify is service-unavailable, not a denial`.
+
+**Two of the rows added 2026-08-27 introduce a third outcome that is not
+part of this taxonomy at all.** A tenant-scoped key (`accounts:player-accounts-read`
+or `accounts:player-read`) that verifies successfully — key-server said
+`active: true`, the scope was granted — but names no usable `metadata.tenants`
+answers **403**. This is decided *after* a real verdict was reached; it is a
+statement about the key's own configuration, not a substitute for the
+401-vs-503 split above, and a future route must not fold it into either side
+of that split.
 
 **`KEY_SERVER_BASE_URL` / `KEY_SERVER_VERIFY_TIMEOUT_SECONDS`**, read by every
 row in this table, were never documented at the contract level before this
@@ -1093,9 +1191,39 @@ additive dual-accept alongside the pre-existing shared `INTROSPECT_API_KEY`
 disables the `mxs_` branch rather than refusing to boot, so key-server being
 mid-deploy can never take the shared-key path down with it.
 
+**`maxgame-launcher-backend` (added 2026-08-27) is a second exception on
+"required," for a related but distinct reason.** It has no dual-accept path
+at all — `/v1/external/games?channel=` is `mxs_`-only — so idp's reasoning
+does not apply verbatim, even though the shape (`Option<KeyServerConfig>`,
+boot succeeds either way) is identical. The reason here is proportionality:
+key-server gates `mailer`'s and `utility`'s *entire reason to exist* — take
+it away and the one route each service has left to serve is gone — but on
+launcher-backend it gates exactly **one** read route, while the game catalog
+every other field this service polls, the download endpoints, and the whole
+back-office admin surface have nothing to do with key-server at all. Failing
+boot on an absent `KEY_SERVER_BASE_URL` would trade a one-route outage for a
+total one, over precisely the configmap-before-image deploy-ordering race
+this fleet has already been bitten by (plan §6's "deploy-order landmine").
+Unset → every `/v1/external/*` request answers **503** — no verdict was
+reached, which is not a claim about the caller's credential — and every
+other route on the service is unaffected; set → the same required/optional
+sub-fields apply as everywhere else in this table (`KEY_SERVER_VERIFY_TIMEOUT_SECONDS`
+default `3`, a `0` refused at boot, `https://` enforced outside development).
+Confirmed in `maxgame-launcher-backend/src/config.rs` (`Config::key_server:
+Option<KeyServerConfig>`, test `the_key_server_is_optional_and_off_when_unset`)
+and `src/infrastructure/service_key.rs` (`require_service_key`'s `None`
+branch returns `DomainError::Unavailable`, never `DomainError::Unauthorized`
+— an absent config is "cannot verify," not "credential rejected").
+
 Confirmed matching this shape in `maxgame-utility-server/src/config.rs`
-(`KeyServerConfig`, required + `parse_or(..., 3)`) and
-`maxgame-mail-server/src/config.rs` (same shape, plus the https check above).
+(`KeyServerConfig`, required + `parse_or(..., 3)`),
+`maxgame-mail-server/src/config.rs` (same shape, plus the https check above),
+and — for the fields that apply once `key_server` is set —
+`maxgame-launcher-backend/src/config.rs` (`a_key_server_base_url_resolves_to_the_verify_endpoint`,
+`a_zero_key_server_verify_timeout_is_refused`,
+`a_plaintext_key_server_base_url_is_refused_outside_development`); the only
+structural difference from `mailer`/`utility` is that launcher-backend's
+whole `KeyServerConfig` is `Option`-wrapped rather than required.
 
 ---
 
