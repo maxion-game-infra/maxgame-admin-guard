@@ -97,11 +97,19 @@ impl Default for AdminIntrospectClient {
 #[async_trait]
 impl AdminIntrospector for AdminIntrospectClient {
     async fn introspect(&self, token: &str) -> GuardResult<AdminIntrospection> {
-        if !self.breaker.allow_request() {
+        // Held for the rest of the call rather than converted to a `bool`.
+        // While the breaker is half-open this permit is its one probe, and
+        // every line below is downstream of an `.await` — a client that
+        // disconnects or an outer request timeout drops this future without
+        // running any of the `record_*` calls. The permit's `Drop` is what
+        // hands the probe back in that case; without it one cancelled
+        // mutation would leave the breaker refusing every admin write on
+        // this pod until it was restarted.
+        let Some(permit) = self.breaker.allow_request() else {
             return Err(GuardError::unavailable(
                 "admin IdP introspection is temporarily unavailable",
             ));
-        }
+        };
 
         // Only the access token is ever sent — never a refresh token.
         let response = self
@@ -113,14 +121,14 @@ impl AdminIntrospector for AdminIntrospectClient {
             .send()
             .await
             .map_err(|e| {
-                self.breaker.record_failure();
+                permit.record_failure();
                 tracing::warn!(error = %e, "admin IdP introspect call failed");
                 GuardError::unavailable("unable to verify admin session with the IdP")
             })?;
 
         let status = response.status();
         if !status.is_success() {
-            self.breaker.record_failure();
+            permit.record_failure();
             tracing::warn!(
                 status = status.as_u16(),
                 "admin IdP introspect returned non-2xx"
@@ -131,7 +139,7 @@ impl AdminIntrospector for AdminIntrospectClient {
         }
 
         let body = response.json::<IntrospectionBody>().await.map_err(|e| {
-            self.breaker.record_failure();
+            permit.record_failure();
             tracing::warn!(error = %e, "admin IdP introspect response was malformed");
             GuardError::unavailable("admin IdP introspection response was malformed")
         })?;
@@ -139,7 +147,7 @@ impl AdminIntrospector for AdminIntrospectClient {
         // A 2xx is the IdP working, whatever its verdict — recording
         // success here (rather than only on `active: true`) is what keeps a
         // stream of revoked tokens from tripping the breaker.
-        self.breaker.record_success();
+        permit.record_success();
         Ok(body.into())
     }
 }
@@ -297,10 +305,77 @@ mod tests {
 
         assert!(client.introspect("tok").await.is_err());
         assert!(
-            !client.breaker.allow_request(),
+            client.breaker.allow_request().is_none(),
             "one failure should open a threshold-1 breaker"
         );
         clock.advance(Duration::from_millis(30_001));
-        assert!(client.breaker.allow_request(), "the window has passed");
+        assert!(
+            client.breaker.allow_request().is_some(),
+            "the window has passed"
+        );
+    }
+
+    /// VS-01, on the admin *write* path. The breaker's half-open probe is
+    /// lent to one caller, and that caller can be cancelled mid-call: the
+    /// service's own request timeout fires, or the operator closes the tab.
+    /// None of the `record_*` calls in `introspect` run in that case, so if
+    /// the probe were only returned by them, this pod would answer 503 to
+    /// every admin mutation from here on — including after the IdP came
+    /// back, which is what makes it a latch rather than a breaker.
+    #[tokio::test]
+    async fn a_mutation_cancelled_while_probing_does_not_wedge_the_write_path() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let clock = Arc::new(crate::clock::FakeClock::new());
+        let client = AdminIntrospectClient::new(
+            reqwest::Client::new(),
+            format!("{}/api/v1/oauth/introspect", server.uri()),
+            "introspect-key",
+        )
+        .with_timeout(Duration::from_secs(5))
+        .with_breaker_clock(1, Duration::from_secs(30), clock.clone());
+
+        // One failure opens a threshold-1 breaker.
+        assert!(client.introspect("tok").await.is_err());
+
+        // The window passes, so the next mutation is lent the probe — and is
+        // then cut short while the IdP is still thinking about it.
+        clock.advance(Duration::from_millis(30_001));
+        server.reset().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "active": true, "adminId": "a", "role": "admin" }))
+                    .set_delay(Duration::from_secs(30)),
+            )
+            .mount(&server)
+            .await;
+        let cut_short =
+            tokio::time::timeout(Duration::from_millis(100), client.introspect("tok")).await;
+        assert!(
+            cut_short.is_err(),
+            "the probe has to still be in flight when it is cancelled"
+        );
+
+        // The IdP is healthy now. Before the permit, every call from here on
+        // was `Unavailable` for the life of the process.
+        server.reset().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    json!({ "active": true, "adminId": "admin-1", "role": "admin" }),
+                ),
+            )
+            .mount(&server)
+            .await;
+        let verdict = client
+            .introspect("tok")
+            .await
+            .expect("a cancelled probe must not outlive the outage it was sent to measure");
+        assert!(matches!(verdict, AdminIntrospection::Active { .. }));
     }
 }

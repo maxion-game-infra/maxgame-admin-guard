@@ -37,7 +37,7 @@ pub mod token;
 
 pub use access::{normalize_site_access, AdminIdentity, SiteAccess, ROLE_SUPER_ADMIN};
 pub use axum_ext::{bearer_token, require_admin, VerifiedAdmin};
-pub use circuit_breaker::CircuitBreaker;
+pub use circuit_breaker::{CircuitBreaker, RequestPermit};
 pub use clock::{Clock, FakeClock, SystemClock};
 pub use error::{GuardError, GuardResult};
 pub use guard::{AdminGuard, AuthorizedAdmin, GuardConfig, Requirement};
