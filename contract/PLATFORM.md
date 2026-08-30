@@ -106,7 +106,7 @@ These were identified while writing this document (M1) or during M2 implementati
 
 ### 1.5 Documented exceptions
 
-- **idp OAuth endpoints** (`/api/v1/oauth/*`) keep RFC 6749's
+- **idp OAuth endpoints** (`/v1/oauth/*`) keep RFC 6749's
   `{"error": "...", "error_description": "..."}` — this is a spec, not a
   house style, and every OAuth client in the wild expects it. idp's own
   *non*-OAuth REST routes (e.g. `/api/v1/admin/...`) should still use §1.1;
@@ -117,7 +117,7 @@ These were identified while writing this document (M1) or during M2 implementati
   §1.1's shape) — it's being retired, not migrated.
 - **`mailer` (`maxgame-mail-server`) splits by surface.** Its **admin**
   routes (`/v1/admin/*`) conform to §1.1 in full. Its **team** routes
-  (`POST /v1/emails:send`, `GET /v1/jobs/{id}`) keep the nested
+  (`POST /v1/external/emails:send`, `GET /v1/external/jobs/{jobId}`) keep the nested
   `{"error": {"code", "message"}}` envelope inherited from
   `maxgame-email-server-legacy`, because `web-cs-backend`
   (`src/adapters/notification/relay_email_service.rs`) and `mu-alpha-pipeline`
@@ -408,9 +408,40 @@ itself, which *is* the IdP) reads:
 |---|---|---|
 | `ADMIN_IDP_BASE_URL` | yes | — |
 | `ADMIN_JWT_ISSUER` | yes | — (byte-compared against the token's `iss`, not derived from the base URL) |
-| `ADMIN_JWKS_URL` | no | `{ADMIN_IDP_BASE_URL}/.well-known/jwks.json` |
+| `ADMIN_JWKS_URL` | **yes** (2026-08-30) | ~~`{ADMIN_IDP_BASE_URL}/.well-known/jwks.json`~~ — the derivation still exists in code but now aims at a 404; see below |
 | `ADMIN_INTROSPECT_API_KEY` | yes once the repo introspects on mutations; optional otherwise | — |
-| `ADMIN_INTROSPECT_PATH` | no | `/api/v1/oauth/introspect` |
+| `ADMIN_INTROSPECT_PATH` | no | `/v1/external/introspect` |
+
+**`ADMIN_JWKS_URL` must be set explicitly, and it does not share a host path
+with introspect.** As of the 2026-08-30 taxonomy wave the idp serves
+`/.well-known/jwks.json` at its **pod root**, outside `BASE_PATH`, while
+introspection stays under the prefix. So the two URLs a consumer resolves now
+point at different places on purpose:
+
+| | value in-cluster | why |
+|---|---|---|
+| `ADMIN_IDP_BASE_URL` | `https://api.<env>/admin-accounts` | introspect really does traverse the gateway |
+| `ADMIN_JWKS_URL` | `http://admin-auth.platform.svc:8091/.well-known/jwks.json` | every consumer of the admin JWKS is a fleet pod; the document has no business leaving through the ingress |
+
+**There is no fallback.** All seven consumers refuse to boot when
+`ADMIN_JWKS_URL` is unset, naming the variable. The derivation that used to
+cover it (`{ADMIN_IDP_BASE_URL}/.well-known/jwks.json`) was deleted rather than
+corrected, because it could not produce a right answer any more: the two URLs
+above point at different places on purpose. Deriving from the base URL's origin
+does not work either — in a deployed tier that origin is the gateway, and
+pod-root paths are unreachable through the gateway by construction.
+
+Refusing at boot is deliberate. The alternative is what happened on 2026-08-30:
+a URL that 404s, a consumer that cannot obtain a verifying key, and therefore a
+**fail-closed 503** (rule 5) on every admin request fleet-wide, with nothing in
+the idp's own logs to explain it. A pod that will not start and says why is the
+better failure.
+
+⚠️ **This rule is about the *admin* JWKS only.** `maxgame-auth-server` serves
+its own `/.well-known/jwks.json` **under** its `BASE_PATH`, deliberately: that
+document verifies *player* tokens and is read by parties outside the fleet,
+who have nothing but the gateway. The two placements are opposite because the
+audiences are opposite — do not "harmonise" them.
 
 Already correct, verbatim, in `utility` (`.env.example:20-30`, though
 `ADMIN_INTROSPECT_API_KEY` is presently optional there — becomes required
@@ -618,8 +649,8 @@ Where a limiter does exist today:
 
 | Service | Endpoint(s) | Key | Env (default) | State |
 |---|---|---|---|---|
-| `idp` | `POST /api/v1/oauth/google/start` | IP | `RATE_LIMIT_START_PER_MINUTE=20` | in-memory, per replica |
-| `idp` | `POST /api/v1/oauth/token` | IP | `RATE_LIMIT_TOKEN_PER_HOUR=60` | in-memory, per replica |
+| `idp` | `POST /v1/oauth/google/start` | IP | `RATE_LIMIT_START_PER_MINUTE=20` | in-memory, per replica |
+| `idp` | `POST /v1/oauth/token` | IP | `RATE_LIMIT_TOKEN_PER_HOUR=60` | in-memory, per replica |
 | `keyServer` | `POST /v1/verify` | presented `mxs_` key (SHA-256 via `domain::hash_key`; IP fallback for bodies with no parseable `mxs_` candidate; 10k-bucket cap, fail-closed on *new* buckets at capacity) | `RATE_LIMIT_VERIFY_PER_MIN=120` (per key since `f3e2f7c` — was per IP, which under k8s SNAT would have collapsed every S2S caller onto a handful of node-IP buckets and, because callers treat non-200 as 503 fail-closed, turned the limit into a fleet-wide mutation outage) | in-memory, per replica |
 | `utility` | `POST /v1/partner/presign-upload` | IP | `PARTNER_PRESIGN_PER_HOUR=15` (documented exception, §1.5-style — see rule 2) | in-memory, per replica |
 | `web` | `POST /admin/user-reports` (public submission) | IP (salted hash) | `USER_REPORTS_PER_HOUR=10` (documented exception, same as above) | **Postgres** (`rate_limit_counters`) — survives restarts, correct across replicas |
@@ -710,7 +741,7 @@ Normative rules, extracted from the above rather than invented:
    `launcher`'s coupon-redeem limiter keys by `player_id`, not IP, precisely
    because the route sits behind player auth and an IP-keyed limiter would
    both be weaker (NAT/shared-IP false sharing) and unnecessary (the real
-   identity is already known). `keyServer`'s `/v1/verify` limiter is the
+   identity is already known). `keyServer`'s `/v1/external/verify` limiter is the
    second example: it keys by the presented `mxs_` key (hashed), because the
    unit of S2S identity is the key, not the socket — and under k8s SNAT the
    socket address actively lies (every pod egresses as one of a handful of
@@ -722,6 +753,40 @@ Normative rules, extracted from the above rather than invented:
    `maxgame-launcher-backend/src/config.rs:1195-1209` both test a
    non-numeric value for their respective rate-limit env vars and assert the
    boot fails naming that variable.
+
+### 3.7 An applied migration is frozen — **including its comments**
+
+`sqlx migrate run` checksums the **whole file**, comments included, and refuses
+with `migration N was previously applied but has been modified`. A one-line
+doc-comment edit is therefore indistinguishable from rewriting the DDL.
+
+This bit on 2026-08-30: a worker corrected a stale path reference inside
+`maxgame-auth-server/migrations/0001_initial_schema.up.sql` — a comment, nothing
+executable — and `make up` died on the next migrate. Reverted.
+
+**What makes it dangerous is that nothing in the normal loop catches it:**
+
+- `ci.sh` cannot. `#[sqlx::test]` builds a fresh database per test, so every
+  checksum matches by construction. The suite was run twice with the edit in
+  place and was clean both times.
+- Boot cannot. Services read the max applied migration *version* and never
+  checksum (e.g. `maxgame-auth-server/src/infrastructure/boot.rs`).
+
+So it stays invisible until someone runs `migrate.sh` against dev or prod —
+where it fails on *their* unrelated migration, with an error naming a file they
+never touched.
+
+**Consequence, and it is permanent:** a comment inside an applied migration that
+has gone stale **cannot be corrected in place**. A future tidy-up pass that
+"fixes" the wording reintroduces the break. The live example is that same
+`0001_initial_schema.up.sql:29`, which still documents `/internal/v1/*` — a path
+the 2026-08-30 taxonomy wave retired. Leave it. `src/interface/routes/internal.rs`
+is the authoritative description, and the migration already points there.
+
+The only safe corrections are a **new** migration carrying an updated note, or a
+pointer from source. Applies to all eight repos: every one of them has squashed
+to one or two migrations, so the file a tidy-up pass is most likely to open is
+always one that has already been applied somewhere.
 
 ---
 
@@ -812,7 +877,7 @@ place, only not yet scheduled.
 
 ---
 
-## 6. Service-to-service: key-server `/v1/verify` (ADR D7)
+## 6. Service-to-service: key-server `/v1/external/verify` (ADR D7)
 
 Every **new** S2S integration whose caller sits outside this fleet (tier 3
 of §6.0 below) authenticates via a `mxs_...` key issued by
@@ -847,28 +912,77 @@ belongs to exactly one tier:
    `workloads/maxgame-auth-server/` has no Ingress of its own — so the single
    gateway allowlist is the whole of the enforcement. Naming a control that
    does not exist is worse than naming none: it invites a reader to assume a
-   second line of defence is in place. Note also that no `NetworkPolicy` exists
-   anywhere in that repo today, so "inside the cluster" is one flat trust zone
-   and every pod in it — including internet-facing ones in `playground` — can
-   reach every `/internal/*` route. That is the tier-2 model as designed, not a
-   defect, but it is the reason the ingress allowlist has to hold absolutely. A
+   second line of defence is in place. **Superseded 2026-08-29:** this paragraph
+   previously went on to describe the cluster as one flat trust zone in which any
+   pod could reach any `/internal/*` route, on the grounds that the gateway
+   allowlist was the only control in place. That is no longer the model. A
+   `NetworkPolicy` restricting ingress to the serving port is now a **required
+   part of exposing `/internal/*`**, not an optional hardening step: a service
+   that adds an `/internal/*` route without one is incomplete, the same way a
+   service that adds a route without a test is. The allowlist and the policy are
+   two independent controls and the tier-2 model now assumes both. A
    caller may send
    `X-Internal-Caller: <service-name>` as a debug courtesy; the callee logs
    it if present but never verifies it, and there is deliberately **no
    audit trail** between fleet members calling each other this way — the
    platform philosophy (per the design doc) is that communication *inside*
    the fleet should be as simple as possible: no key issuance, no key
-   rotation, no verify round-trip, nothing to audit. Concrete instances
-   today: `maxgame-auth-server` exposes `GET /internal/v1/games`, called by
+   rotation, no verify round-trip, nothing to audit.
+   **Where `/internal/*` is mounted is part of the rule (2026-08-29).** The group
+   sits at the **pod root, outside `BASE_PATH`** — the same place `/healthz`,
+   `/readyz` and `/metrics` sit, for the same reason. Every gateway route is a
+   prefix match on a service's `BASE_PATH`, so a route mounted outside that prefix
+   is unreachable through the gateway *by construction* rather than by anyone
+   remembering to keep it off an allowlist. Mounting `/internal/*` **under**
+   `BASE_PATH` would mean the existing prefix rule routes it from the internet on
+   the day it is added, with no auth on it, and nothing in the ingress would look
+   wrong. `maxgame-auth-server` already does this
+   (`src/interface/routes/mod.rs`, `/internal/*` kept out of the group that nests
+   under `BASE_PATH`) and pins it with a conformance assertion that
+   `<BASE_PATH>/internal/...` must answer 404; every service adding a tier-2 route
+   copies both the placement and that assertion. Concrete instances
+   today: `maxgame-auth-server` exposes `GET /v1/internal/games`, called by
    `maxgame-launcher-backend` (§6.4's retired-`ADMIN_API_KEYS` row). This
    plan (2026-08-24) adds a second route at the same path —
-   `GET /internal/v1/games[?channel=dev|sit|uat|staging|prod]` — on
+   `GET /v1/internal/games[?channel=dev|sit|uat|staging|prod]` — on
    `maxgame-launcher-backend` itself: same path, two different services,
    and deliberately **different response bodies** (shape documented in
    that repo's own README, not here — this contract doesn't own it), so no
    caller may point one route's deserializer at the other's response. That
    makes `maxgame-launcher-backend` a tier-2 callee as well as a tier-2
-   caller. **Reserved status strings:** a tier-2 route that reports another
+   caller.
+   **BUILT (2026-08-30); consumer migration is partial — the IdP is inside this model now.**
+   Every service in the fleet used to call `idp`'s introspection through the
+   public gateway with the shared `INTROSPECT_API_KEY` — the one fleet-internal
+   call that left the cluster to reach a pod beside it, on the hot path of every
+   mutation the platform serves. The fix is the twin shape
+   already used above: `POST /v1/internal/introspect` at the pod root carrying no
+   credential for tier 2, beside the existing `POST /v1/external/introspect`
+   (`x-api-key`) which stays exactly as it is for tier 3 — one handler, two doors,
+   the same relationship `GET /v1/internal/games` has to `GET /v1/external/games`.
+   The shared secret is a *door* — "you are a fleet member" — not an
+   authorization input, so where the network boundary already answers that
+   question the credential is redundant, which is the whole of the tier-2
+   argument. JWKS fetches move the same way for the same reason and carry no
+   credential to begin with. Not in scope: `POST /v1/verify`, whose **body**
+   carries a third party's `mxs_` key in the clear — that one keeps its https
+   gateway path until in-cluster TLS exists, because moving it would trade one
+   exposure for another rather than removing one.
+   **Where this actually stands.** The route exists: `maxgame-admin-auth-server`
+   serves `POST /v1/internal/introspect` at the pod root
+   (`src/inbound/internal.rs`), with `tests/internal.rs` pinning both the
+   handler and the `<BASE_PATH>/v1/internal/introspect` 404 that keeps it off
+   the gateway. Consumers are **partly** moved: `maxgame-auth-server` (config
+   default), `maxgame-news-backend`, `maxgame-web-backend` and
+   `maxgame-mail-server` point `ADMIN_INTROSPECT_PATH` at it;
+   `maxgame-launcher-backend`, `maxgame-utility-server` and
+   `maxgame-key-server` still resolve the gateway path
+   (`/v1/external/introspect`) with `x-api-key`. Both doors are contract, so a
+   half-migrated fleet is a supported state rather than a broken one — but do
+   not read this paragraph as "everyone is on the internal path". The
+   `INTROSPECT_API_KEY` stays provisioned everywhere until the last consumer
+   moves, and a service that has moved must still be able to fall back.
+   **Reserved status strings:** a tier-2 route that reports another
    service's status verbatim must be able to say "I could not ask" and "it
    answered, and has no such record" as answers distinct from any real
    value. `unknown` and `unregistered` are therefore reserved fleet-wide for
@@ -882,7 +996,7 @@ belongs to exactly one tier:
    a tenant plus a slot no longer names an account — the deployment lane is part of
    the key. Three wire shapes changed with it and any tier-2 caller reading them
    must expect the new field: `GET /v1/me/accounts` and
-   `GET /internal/v1/players/{player_id}/accounts` now name each slot's `channel`,
+   `GET /v1/internal/players/{player_id}/accounts` now name each slot's `channel`,
    and a game JWT carries a `channel` claim beside `tenant`/`acct`.
    The claim is **descriptive, not authoritative** — `acct` already binds the
    channel by hashing it, so a verifier must never prefer the claim over the
@@ -1025,7 +1139,7 @@ and `Cookie`, and only cross-host. That leaves exposed:
   **body**, and the introspect secret, which it sends as the custom header
   `x-api-key` (`rust/src/introspect_client.rs`);
 - any service key sent in a request body, e.g. the plaintext `mxs_` key in
-  `/v1/verify`'s body.
+  `/v1/external/verify`'s body.
 
 It also routes around §3.3's https guardrails, which validate the *configured*
 URL and cannot see where a redirect leads — the same class of gap as the
@@ -1110,7 +1224,7 @@ not merely observed.
 | `LAUNCHER_RELEASE_API_KEY` / `GAME_RELEASE_API_KEY` | `x-release-api-key` | launcher (the two `ci-register` routes) | `launcher:release-upload` |
 | `LAUNCHER_COUPONS_PIPELINE_SECRET` | `x-pipeline-secret` | launcher (mu-alpha-pipeline coupon routes) | `launcher:coupon-pipeline` |
 | `DOWNLOAD_APP_KEYS` (JSON map) | `X-Download-App-Key` | launcher (download-token minting) | not yet scoped — per-app, not per-service |
-| ~~`ADMIN_API_KEYS` (env) / DB-backed key~~ | ~~`X-Admin-Key`~~ | ~~`maxgame-auth-server`~~ | **RETIRED 2026-08-16** — not migrated onto key-server, deleted outright. Its one caller, `maxgame-launcher-backend`, is tier 2 of §6.0: it now reaches `maxgame-auth-server` over cluster-internal DNS under `/internal/v1/*` with no credential at all (no key, no header, no verify round-trip). The DB-backed key table, its CRUD routes, and the dual-accept branch in `src/interface/middleware/admin.rs` are removed, not preserved as a legacy fallback — see `2026-08-16-internal-s2s-design.md` (P1/P2). Admin JWT is now the only credential form this service's `/v1/admin/*` routes accept. |
+| ~~`ADMIN_API_KEYS` (env) / DB-backed key~~ | ~~`X-Admin-Key`~~ | ~~`maxgame-auth-server`~~ | **RETIRED 2026-08-16** — not migrated onto key-server, deleted outright. Its one caller, `maxgame-launcher-backend`, is tier 2 of §6.0: it now reaches `maxgame-auth-server` over cluster-internal DNS under `/v1/internal/*` with no credential at all (no key, no header, no verify round-trip). The DB-backed key table, its CRUD routes, and the dual-accept branch in `src/interface/middleware/admin.rs` are removed, not preserved as a legacy fallback — see `2026-08-16-internal-s2s-design.md` (P1/P2). Admin JWT is now the only credential form this service's `/v1/admin/*` routes accept. |
 | ~~(env-configured admin key)~~ | ~~`x-admin-key`~~ | ~~`maxgame-email-server-legacy`~~ | **RETIRED** — `maxgame-mail-server` replaced it with `maxion-admin-guard` (super_admin only) on the admin surface. Its team surface dual-accepted the legacy per-tenant `mxk_live_…` bearer key (a tenant credential, not an S2S service key, so it never belonged in this table) alongside a `mxs_` key-server key until **Phase 4 of the mail-server key consolidation retired `mxk_live_…` outright (2026-08-18)** — the team surface now accepts `mxs_` only, see §6.5, not this table: mxs is the standard for this surface, not a legacy secret being tracked for a future migration |
 
 None of these are touched by this plan (plan §7 follow-up item 4). They are
@@ -1133,19 +1247,19 @@ qualifies.
 
 | Service | Route(s) | Scope required | Identity mapping |
 |---|---|---|---|
-| `mailer` (`maxgame-mail-server`) | `POST /v1/emails:send`, `GET /v1/jobs/{id}` (both behind `require_team`) | `email:send` | `key_id` → stored **unprefixed** in `jobs.key_id` and the audit trail. Before Phase 4 of the mail-server key consolidation (2026-08-18) this was stored as `mxs:{key_id}`, prefixed to keep it from colliding with this service's own `api_keys.id` — Phase 4 dropped that table outright, so there is only one id namespace left and nothing to disambiguate · `team_name` → verify's `consumer`, which `modules::jobs_get`'s ownership check compares instead of `key_id` since Phase 4 (a rotated key gets a new `key_id` but keeps the same `consumer`) · `allowed_senders` → verify's `metadata.allowed_senders` (array of sender-id strings), **explicit only**: no `metadata`, no `allowed_senders` field, or an empty array all mean **no senders**, never "every sender". `/v1/verify` has no sender concept of its own — `metadata` is free-form — so this mapping is the only place enforcing the "empty means none, not all" rule an `email:send` key would otherwise bypass entirely, turning one key into the ability to impersonate every sender the service knows about. Source: `maxgame-mail-server/src/adapters/key_server.rs` (`VerifiedServiceKey::allowed_senders`) and `src/infrastructure/team_auth.rs` (`verify_via_key_server`). `mxs_`-only as of Phase 4 (2026-08-18) — the legacy per-tenant `mxk_live_…` bearer key this row used to dual-accept alongside `mxs_` was retired outright, not kept as a fallback. |
+| `mailer` (`maxgame-mail-server`) | `POST /v1/external/emails:send`, `GET /v1/external/jobs/{jobId}` (both behind `require_team`) | `email:send` | `key_id` → stored **unprefixed** in `jobs.key_id` and the audit trail. Before Phase 4 of the mail-server key consolidation (2026-08-18) this was stored as `mxs:{key_id}`, prefixed to keep it from colliding with this service's own `api_keys.id` — Phase 4 dropped that table outright, so there is only one id namespace left and nothing to disambiguate · `team_name` → verify's `consumer`, which `modules::jobs_get`'s ownership check compares instead of `key_id` since Phase 4 (a rotated key gets a new `key_id` but keeps the same `consumer`) · `allowed_senders` → verify's `metadata.allowed_senders` (array of sender-id strings), **explicit only**: no `metadata`, no `allowed_senders` field, or an empty array all mean **no senders**, never "every sender". `/v1/external/verify` has no sender concept of its own — `metadata` is free-form — so this mapping is the only place enforcing the "empty means none, not all" rule an `email:send` key would otherwise bypass entirely, turning one key into the ability to impersonate every sender the service knows about. Source: `maxgame-mail-server/src/adapters/key_server.rs` (`VerifiedServiceKey::allowed_senders`) and `src/infrastructure/team_auth.rs` (`verify_via_key_server`). `mxs_`-only as of Phase 4 (2026-08-18) — the legacy per-tenant `mxk_live_…` bearer key this row used to dual-accept alongside `mxs_` was retired outright, not kept as a fallback. |
 | `utility` (`maxgame-utility-server`) | `POST /v1/partner/presign-upload` | `utility:partner-upload` | `metadata.buckets` (array of bucket-name strings) → which R2 bucket(s) the key may presign into, **explicit only** same as `mailer`'s sender rule — absent/empty/non-array grants no bucket, never every bucket (`VerifiedServiceKey::may_use_bucket`). `mxs_`-only — no legacy credential form on this route. Source: `maxgame-utility-server/src/adapters/key_server.rs`, `src/infrastructure/service_key_auth.rs`. |
 | `authServer` (`maxgame-auth-server`) | `POST /v1/auth/introspect` | `accounts:introspect` | Possession-only gate: a valid key with the scope unlocks the route, the verify response otherwise isn't mapped onto anything — the route's own answer is the introspection result for the player access token in the request body, unrelated to the key's `key_id`/`consumer`/`metadata`. `mxs_`-only — this route carries no legacy shared secret to fall back to. Added 2026-08-17 (this plan) so external callers can introspect player tokens without a fleet-internal `/internal/*` hop; `x-verifier-service: maxgame-auth-server`. Source: `maxgame-auth-server/src/infrastructure/adapters/key_server.rs`, `src/interface/middleware/service_key.rs`. *(Corrected 2026-08-27: this row previously gave the header value as `auth-server`, which no service sends, and named two source files that do not exist — `src/adapters/key_server.rs` and `src/infrastructure/service_key_auth.rs`. Both were wrong from the day the row was written.)* |
-| `idp` (`maxgame-admin-auth-server`) | `POST /api/v1/oauth/introspect` | `idp:introspect` | Same possession-only gate as `authServer` above — verify only unlocks the route, the introspection result comes from the admin access token in the request body. **Dual-accept**: a credential starting with `mxs_` is verified via key-server; anything else falls back to a constant-time compare against the legacy shared `INTROSPECT_API_KEY`, with **no cross-fallback either direction** — an `mxs_` key that fails verification is never retried against the shared secret. Added 2026-08-17 (this plan) so external callers no longer need the shared secret every fleet member also holds; `x-verifier-service: admin-auth`. `KEY_SERVER_BASE_URL` is optional here (unlike the other rows) — unset disables only the `mxs_` path, so a deploy-order mistake can't take down the shared-key path every mutation in the fleet depends on. Source: `maxgame-admin-auth-server/src/adapters/key_server.rs`, `src/infrastructure/api_key.rs`. |
-| `authServer` (`maxgame-auth-server`) | `GET /v1/external/games` | `accounts:games-read` | **Possession-only** — the same shape as `accounts:introspect` above: a valid, unrevoked key carrying the scope unlocks the route, and the verified key's `metadata` is not read at all. Nothing about the game catalog varies by caller, so there is nothing to scope it by; the body is `GameService::admin_list()` verbatim, the same one `GET /v1/admin/games` and `GET /internal/v1/games` serve. `mxs_`-only — this route carries no legacy credential form. Added 2026-08-27 (external API tier-3 plan, `/v1/external/*`, §6.0 point 3). Source: `maxgame-auth-server/src/interface/routes/external.rs::games`. |
+| `idp` (`maxgame-admin-auth-server`) | `POST /v1/external/introspect` | `idp:introspect` | Same possession-only gate as `authServer` above — verify only unlocks the route, the introspection result comes from the admin access token in the request body. **Dual-accept**: a credential starting with `mxs_` is verified via key-server; anything else falls back to a constant-time compare against the legacy shared `INTROSPECT_API_KEY`, with **no cross-fallback either direction** — an `mxs_` key that fails verification is never retried against the shared secret. Added 2026-08-17 (this plan) so external callers no longer need the shared secret every fleet member also holds; `x-verifier-service: admin-auth`. `KEY_SERVER_BASE_URL` is optional here (unlike the other rows) — unset disables only the `mxs_` path, so a deploy-order mistake can't take down the shared-key path every mutation in the fleet depends on. Source: `maxgame-admin-auth-server/src/adapters/key_server.rs`, `src/infrastructure/api_key.rs`. |
+| `authServer` (`maxgame-auth-server`) | `GET /v1/external/games` | `accounts:games-read` | **Possession-only** — the same shape as `accounts:introspect` above: a valid, unrevoked key carrying the scope unlocks the route, and the verified key's `metadata` is not read at all. Nothing about the game catalog varies by caller, so there is nothing to scope it by; the body is `GameService::admin_list()` verbatim, the same one `GET /v1/admin/games` and `GET /v1/internal/games` serve. `mxs_`-only — this route carries no legacy credential form. Added 2026-08-27 (external API tier-3 plan, `/v1/external/*`, §6.0 point 3). Source: `maxgame-auth-server/src/interface/routes/external.rs::games`. |
 | `authServer` (`maxgame-auth-server`) | `GET /v1/external/players/{player_id}/accounts` | `accounts:player-accounts-read` | `metadata.tenants` (`VerifiedServiceKey::granted_tenants`), **explicit only** — the same fail-closed shape as `mailer`'s `allowed_senders` and `utility`'s `buckets` above: **absent `metadata`, absent `tenants`, an empty array, or a non-array all mean no tenant, never every tenant.** A non-string entry sitting beside good ones in the array is dropped rather than voiding the rest; each string entry is trimmed, so a whitespace-only entry (e.g. `" "`) is dropped the same way an empty string is, and `" mu-maxage "` grants exactly `mu-maxage`. Tenant matching is **exact** — byte equality, no case folding of any kind. It has to be, and the reason is the rule stated in §6.0 above: `game.tenant` is an unnormalized `TEXT PRIMARY KEY` looked up with `=`, so two tenants differing only in case are two different games, and a comparison looser than the identity would authorize a key granted one to read the other. **This row briefly said the opposite.** Between 2026-08-27's first and second passes the comparison was `eq_ignore_ascii_case`, copied from `utility`'s `may_use_bucket` — safe *there*, because bucket names are lowercased at registration, and a privilege widening *here*, because tenants are not. A mistyped tenant therefore now grants **nothing** rather than something wider; typo-tolerance belongs at issue time, where the back office validates the value against the live tenant list and the operator gets an error instead of a broader key. A key naming **no** usable tenant answers **403**, once, at the gate, rather than 200-with-nothing — a statement about the caller's own misconfiguration, not about any player, so it costs nothing to say plainly and saves the key's owner a debugging session. A key that does name a usable tenant sees only the accounts held in it; a player who holds none of them answers **404**, byte-identical to a `player_id` that does not exist at all — see §6.0's 404-collapse rule, which this row inherits rather than restates. `mxs_`-only. Added 2026-08-27. Source: `maxgame-auth-server/src/infrastructure/adapters/key_server.rs` (`VerifiedServiceKey::granted_tenants`, `may_see_tenant`, `has_any_tenant`), `src/interface/routes/external.rs` (`visible_accounts`). |
 | `authServer` (`maxgame-auth-server`) | `GET /v1/external/players/{player_id}` | `accounts:player-read` | Same `metadata.tenants` gate, same fail-closed reading, and the same 403/404 split as the row above — this route calls the identical `visible_accounts` predicate, which is what guarantees it can never be more permissive about *who* is visible than the accounts-list route is. Additionally gated on `metadata.pii` (`VerifiedServiceKey::may_see_pii`), **default deny**: **only a literal JSON `true` releases the full payload — absent, `false`, `"true"`, `1`, and every other non-boolean shape all mean the trimmed one.** What `pii: true` unlocks is the player's email address and their Google account id (`links[].provider_account_id`). The trimmed payload (`ExternalPlayerView`) is a **distinct struct that structurally cannot carry either field**, not `MeResult` re-used with a `skip_serializing_if` attribute — an attribute is one careless edit away from leaking the field it hides, whereas a type with no `email` field cannot serialize one no matter what is later done to it. `mxs_`-only. Added 2026-08-27. Source: `maxgame-auth-server/src/infrastructure/adapters/key_server.rs` (`VerifiedServiceKey::may_see_pii`), `src/interface/routes/external.rs` (`ExternalPlayerView`, `ExternalPlayerResponse`). |
-| `launcher` (`maxgame-launcher-backend`) | `GET /v1/external/games?channel=` | `launcher:games-read` | **Possession-only**, the same shape as `accounts:games-read` above: the catalog is the same for every holder, so the verified key's `metadata` is not read. The body is `games_catalog(...)` verbatim — the same function `GET /internal/v1/games` calls — so the two routes cannot answer differently about the data; they differ only in who may ask. `mxs_`-only. Added 2026-08-27. **This is the first scope `maxgame-launcher-backend` enforces, and it makes the service tier-3-facing for the first time.** Before this it was tier-2 only, in both directions §6.0 already describes: a *caller* (its own auth-server join over `/internal/v1/games`) and, since the 2026-08-24 plan, a *callee* (`GET /internal/v1/games` served to fleet-mates with no credential at all). That tier-2 route is untouched by this row — the tier-3 route is a gated twin sitting in front of the same handler body, not a replacement for it. Source: `maxgame-launcher-backend/src/adapters/key_server.rs`, `src/modules/external/mod.rs`. |
+| `launcher` (`maxgame-launcher-backend`) | `GET /v1/external/games?channel=` | `launcher:games-read` | **Possession-only**, the same shape as `accounts:games-read` above: the catalog is the same for every holder, so the verified key's `metadata` is not read. The body is `games_catalog(...)` verbatim — the same function `GET /v1/internal/games` calls — so the two routes cannot answer differently about the data; they differ only in who may ask. `mxs_`-only. Added 2026-08-27. **This is the first scope `maxgame-launcher-backend` enforces, and it makes the service tier-3-facing for the first time.** Before this it was tier-2 only, in both directions §6.0 already describes: a *caller* (its own auth-server join over `/v1/internal/games`) and, since the 2026-08-24 plan, a *callee* (`GET /v1/internal/games` served to fleet-mates with no credential at all). That tier-2 route is untouched by this row — the tier-3 route is a gated twin sitting in front of the same handler body, not a replacement for it. Source: `maxgame-launcher-backend/src/adapters/key_server.rs`, `src/modules/external/mod.rs`. |
 
 Error taxonomy, same as §6.2 with one addition worth naming explicitly: a
 verdict of `active: false` (any of the four `reason` values in §6.1) is a
 401; **anything else that is not a clean 200-with-parseable-body — including
-a 429 from `/v1/verify`'s own rate limiter (per key, §3.6) — is a 503**,
+a 429 from `/v1/external/verify`'s own rate limiter (per key, §3.6) — is a 503**,
 never an implicit pass and never a fallback to the legacy credential form.
 `mailer`'s reference tests: `an mxs key with no metadata.allowed_senders is
 refused`, `an mxs key listing a different sender is refused`, `a rate-limited
@@ -1174,10 +1288,10 @@ fleet-mate's, calls key-server's `POST /v1/verify`) reads:
 | `KEY_SERVER_BASE_URL` | yes | — |
 | `KEY_SERVER_VERIFY_TIMEOUT_SECONDS` | no | `3` (seconds); `0` is rejected at boot — a zero timeout would fail every verify call closed before it could ever succeed |
 
-The verify path itself (`/v1/verify`) is a compile-time constant appended to
+The verify path itself (`/v1/external/verify`) is a compile-time constant appended to
 `KEY_SERVER_BASE_URL`, not a separate env var — there is exactly one path on
 key-server's side, so nothing to override. Outside development,
-`KEY_SERVER_BASE_URL` must resolve to `https://`: the `/v1/verify` request
+`KEY_SERVER_BASE_URL` must resolve to `https://`: the `/v1/external/verify` request
 body carries the caller's plaintext `mxs_` key, so a plaintext URL leaks the
 key in the clear (same reasoning as §3.3's `ADMIN_JWKS_URL`/introspect-URL
 https guardrail). `mailer` enforces this today
@@ -1326,7 +1440,7 @@ section rather than assuming every bullet below applies unmodified.
 - [ ] idp's own non-OAuth admin routes (e.g. `/api/v1/me`) answer §1.1's
       envelope, not a two-field `{error, message}` shape — only idp's OAuth
       endpoints are exempt (§1.5).
-- [ ] `POST /api/v1/oauth/google/start` and `POST /api/v1/oauth/token` each
+- [ ] `POST /v1/oauth/google/start` and `POST /v1/oauth/token` each
       429 once their respective window (`RATE_LIMIT_START_PER_MINUTE`,
       `RATE_LIMIT_TOKEN_PER_HOUR`) is exhausted, carrying `Retry-After`, in
       the RFC 6749 exception envelope (§1.5), not §1.1's (§3.6 rule 1).
@@ -1338,7 +1452,7 @@ section rather than assuming every bullet below applies unmodified.
 - [ ] `GET /v1/admin/keys` and `GET /v1/admin/audit-logs` accept `page`/
       `take`, not `limit`/`offset`, and answer `{items, meta}` (§2.1), not a
       bare array.
-- [ ] A 429 from the `/v1/verify` rate limiter carries `Retry-After`.
+- [ ] A 429 from the `/v1/external/verify` rate limiter carries `Retry-After`.
 - [ ] `AdminKeysError`'s three variants (`UnknownScope`, `InvalidGraceHours`,
       `AlreadyRevoked`) and the bare-500 `Db` variant all answer the §1.1
       envelope, not the current ad hoc `{"error": "..."}` shapes.
@@ -1425,7 +1539,7 @@ section rather than assuming every bullet below applies unmodified.
       `4d6842f` rename, pinned by its own conformance test so the pre-rename
       name can't quietly come back), `allow_headers` includes `x-request-id`
       (`src/inbound/router.rs`).
-- [ ] Team surface (`POST /v1/emails:send`, `GET /v1/jobs/{id}`) verifies
+- [ ] Team surface (`POST /v1/external/emails:send`, `GET /v1/external/jobs/{jobId}`) verifies
       `mxs_` live via key-server, scope `email:send`, **only** — as of Phase 4
       of the mail-server key consolidation
       (`back-office-workspace/.omc/plans/2026-08-18-mailer-key-consolidation.md`,
@@ -1435,7 +1549,7 @@ section rather than assuming every bullet below applies unmodified.
       fallback. `allowed_senders` comes from verify's `metadata.allowed_senders`
       and nothing else — no metadata, or an empty array, grants zero senders,
       never every sender; every non-clean-200 from key-server (including its
-      own `/v1/verify` 429 rate limiter) is a 503, never an implicit pass;
+      own `/v1/external/verify` 429 rate limiter) is a 503, never an implicit pass;
       only a clean `active:false` is a 401. `key_id` is stored **unprefixed**
       everywhere it lands in this service's own text columns (`jobs.key_id`,
       the audit trail) — the `mxs:{key_id}` prefix this row used to describe
