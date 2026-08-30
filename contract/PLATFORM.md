@@ -94,7 +94,7 @@ retry later); a 500's `message` never is. Source: launcher
 
 Source: `maxgame-utility-server/src/inbound/error.rs` (`DomainError::error_code`) for the first eight. `CONFLICT` was added by `maxgame-key-server` (`src/error.rs`, `src/routes/admin_keys.rs` — its one 409 case, "key is already revoked") during M2, since the original eight had no 409 entry; sanctioned as a contract amendment rather than a repo-local invention, so the next repo with a 409 reuses it instead of picking its own string.
 
-**Ruling on vocabulary — a repo may keep its own `code` values.** idp's `code` field carries its pre-existing `DomainError` codes verbatim (`unauthorized`, `not_found`, `forbidden`, …, lowercase snake_case) rather than remapping onto this table's SCREAMING_CASE strings (`src/inbound/error.rs`, fixed in `f45b634` alongside the rest of §1.1). This is allowed: the requirement is that `code` be *stable and machine-readable within a service*, not that every service share one vocabulary — a client already scopes its branching by which service answered, so two services never need to compare `code` values against each other directly. §1.3's table remains the *recommended* starting vocabulary for a service with no existing one of its own (i.e. new services via the M6 template), not a mandate to remap an established one. Per the same ruling, **`utility`** now mixes both within one service: every error that predates the bucket registry still answers with this table's SCREAMING_CASE values, while the new bucket-registry and presign routes contribute their own lowercase snake_case codes (`bucket_not_allowed`, `bucket_not_found`, `invalid_path`, `bucket_exists`, …) via a `DomainError::Coded` variant chosen at the call site — an addition alongside the table, not a remap of it (`maxgame-utility-server/src/inbound/error.rs`, `src/domain/error.rs`; pinned by its own `platform_conformance.rs`).
+**Ruling on vocabulary — a repo may keep its own `code` values.** idp's `code` field carries its pre-existing `DomainError` codes verbatim (`unauthorized`, `not_found`, `forbidden`, …, lowercase snake_case) rather than remapping onto this table's SCREAMING_CASE strings (`src/inbound/error.rs`, fixed in `f45b634` alongside the rest of §1.1). This is allowed: the requirement is that `code` be *stable and machine-readable within a service*, not that every service share one vocabulary — a client already scopes its branching by which service answered, so two services never need to compare `code` values against each other directly. §1.3's table remains the *recommended* starting vocabulary for a service with no existing one of its own (i.e. new services via the M6 template), not a mandate to remap an established one. Per the same ruling, **`utility`** now mixes both within one service: every error that predates the bucket registry still answers with this table's SCREAMING_CASE values, while the new bucket-registry and presign routes contribute their own lowercase snake_case codes (`bucket_not_allowed`, `bucket_not_found`, `invalid_path`, `bucket_exists`, …) via a `DomainError::Coded` variant chosen at the call site — an addition alongside the table, not a remap of it (`maxgame-utility-server/src/inbound/error.rs`, `src/domain/error.rs`; pinned by its own `platform_conformance.rs`). The same pattern was used again on 2026-08-30 for the OAuth client hard delete (§9): idp added `client_has_issued_tokens` and `client_must_be_retired_first` through a `DomainError::ConflictCoded` variant, and `maxgame-auth-server` carries the identical two strings in **its** machine-readable slot, which is `error` rather than `code` (§1.5's documented exception for that repo's `{error, message}` shape). Two services, one vocabulary, two field names — which is exactly what the ruling above permits, and why a caller branches per service rather than globally.
 
 ### 1.4 Non-conformance found and fixed during M2/M3
 
@@ -1081,7 +1081,7 @@ belongs to exactly one tier:
 ```json
 // POST {keyServerBaseUrl}/v1/verify
 // header: x-verifier-service: <caller's own name>   (never send the key in a header, only the body)
-{ "key": "mxs_...", "required_scopes": ["utility:partner-upload"] }
+{ "key": "mxs_...", "required_scopes": ["utility:file-upload"] }
 ```
 
 **`x-verifier-service` has no agreed convention today, and it is worth knowing
@@ -1101,7 +1101,7 @@ on:
 
 ```json
 // 200 — key valid and holds every requested scope
-{ "active": true, "key_id": "3f6c2a1e-…", "consumer": "maxgame-website", "scopes": ["utility:partner-upload"], "metadata": {}, "expires_at": null }
+{ "active": true, "key_id": "3f6c2a1e-…", "consumer": "maxgame-website", "scopes": ["utility:file-upload"], "metadata": {}, "expires_at": null }
 ```
 ```json
 // 200 — denied; reason is one of revoked | expired | not_found | missing_scope
@@ -1175,11 +1175,16 @@ answering 307/308 and asserts the redirect target receives nothing.
 ### 6.3 Scope catalog
 
 ```
-idp:introspect            accounts:introspect  launcher:release-upload
-launcher:coupon-pipeline  email:send           cs:jobs
-utility:partner-upload    accounts:games-read  accounts:player-accounts-read
+idp:introspect            accounts:introspect
+email:send                utility:file-upload
+accounts:games-read       accounts:player-accounts-read
 accounts:player-read      launcher:games-read
 ```
+
+> 2026-08-30: `cs:jobs`, `launcher:release-upload`, `launcher:coupon-pipeline`
+> ถอนออกจาก catalog (ไม่มี service ใด enforce แล้ว) · `utility:partner-upload`
+> เปลี่ยนชื่อเป็น `utility:file-upload` (utility `FILE_UPLOAD_SCOPE` + UI ใหม่) —
+> คีย์ที่ถือชื่อเก่า verify ยังผ่านจนกว่า service ปลายทางจะ require ชื่อใหม่
 
 Every scope is prefixed with the service that actually enforces it
 (`<service>:<action>`) — there is no shared `platform:` owner (that prefix
@@ -1830,3 +1835,99 @@ to invent a name this document would then need to reconcile against:
   method needs no schema change, only a new registered value.
 
 Neither exists in `maxgame-auth-server` today.
+
+---
+
+## 9. OAuth client registries: retire is the default, hard delete is the exception
+
+Both services keep a registry of OAuth clients — `admin_auth.oauth_clients` in
+the idp (admin clients) and `player_auth.oauth_client` in `maxgame-auth-server`
+(player clients). Both implement the same two-verb model, and the reason is a
+security property rather than a preference.
+
+### 9.1 Retire — what `DELETE` does by default
+
+`DELETE /v1/admin/{oauth-,}clients/{id}` is a **soft delete in two committed
+phases, in this order**:
+
+1. `is_active = false`, committed on its own — the client refuses new logins.
+2. Revoke the sessions it granted, in a second transaction.
+
+The row survives, so the `client_id` can never be re-registered, and the audit
+trail still resolves it.
+
+**The phase order is the whole design.** A failure lands in exactly one of two
+places: phase one fails and nothing changed, or phase two fails and the client
+is **off** with its old sessions still alive — which is the state `deactivate`
+already produces and the system already handles. Both phases are idempotent, so
+an operator retries and it converges. Doing all three writes in one transaction
+fails back to *fully live* instead: a client somebody is trying to retire still
+accepting sign-ins until a human notices. **Failing into "off" beats failing
+into "open."**
+
+### 9.2 Hard delete — `?hard=true`, and why it is gated
+
+Freeing a `client_id` means a different app can register it. Anything still
+naming that id — a token, a session, an audit row — then points at the new app
+instead, silently. So the row may only be erased when nothing can be holding
+anything: **the client never issued a token.**
+
+Three refusals, all **409**, machine-readable in each service's own slot
+(`code` for the idp, `error` for `maxgame-auth-server` — §1.3):
+
+| condition | value |
+|---|---|
+| ever issued a token | `client_has_issued_tokens` |
+| still active | `client_must_be_retired_first` |
+| defined in `clients.toml` (idp only) | the pre-existing `conflict` |
+
+The active check is not required by "never issued a token". It is there so a
+live client can never vanish in one call; retire is idempotent, so the two-step
+costs nothing.
+
+### 9.3 🔴 "Never issued a token" is a **column**, never a query
+
+The gate reads `first_token_issued_at` on the client row, written once at the
+single point a token is minted (idp `GrantService::exchange_authorization_code`,
+auth-server `OAuthBrokerService::exchange_code`).
+
+**Deriving it by querying other tables is unsound, and looks rigorous while
+being wrong.** Every table that records a `client_id` is swept on expiry —
+`auth_codes`, `oauth_transactions`, `admin_sessions`, `refresh_tokens`,
+`oauth_auth_code` — and the idp's `audit_logs` has a 400-day retention while
+`maxgame-auth-server` has no audit table at all. "No rows mention this client"
+therefore answers **"nothing recent"**, not **"never"**. Such a check passes
+every test written against fresh data and starts deleting used clients once the
+sweepers catch up.
+
+Two ordering rules follow, and both are security properties:
+
+- **The write happens before the token is minted, and its failure fails the
+  exchange.** Writing afterwards and logging a failure produces the one outcome
+  that must never happen: tokens in the caller's hand, the write lost, the
+  client permanently eligible for a delete it should have been excluded from.
+  Writing first can only *over*-mark, which merely refuses a deletion — the
+  tolerable direction.
+- **The gate runs inside the deleting transaction**, on `SELECT … FOR UPDATE` of
+  the client row. Checking outside it leaves a window for a login to complete
+  between the read and the delete.
+
+### 9.4 Rows that predate the feature are never deletable
+
+Both migrations backfill existing rows with the migration timestamp, not `NULL`.
+A row from before this existed has no trustworthy answer — the evidence was
+swept — and the safe reading of "unknown" is "assume it issued". Only clients
+created afterwards can ever be hard-deleted. That asymmetry is permanent and
+deliberate: the alternative is a migration asserting something about the past it
+cannot know.
+
+### 9.5 What a conformance test must pin
+
+Beyond the obvious refusal, one test carries the design: **issue a token, then
+delete every ephemeral row by hand, then assert the refusal still holds.** A
+derived check passes the ordinary test and fails this one, which is what makes
+it the test worth having (`maxgame-admin-auth-server/tests/clients_management.rs`,
+`maxgame-auth-server/tests/repositories.rs`).
+
+**Known gap:** `maxgame-auth-server` has no audit table, so a hard delete there
+leaves only a log line. The idp writes an audit row before the delete commits.
