@@ -58,6 +58,52 @@ A value that is neither array nor object contributes no entry at all. Output is
 deduplicated and sorted, so two tokens carrying the same grants in a different
 order authorize identically.
 
+## Qualified grants (`feature@qualifier`)
+
+A grant string may carry a qualifier after an `@`:
+
+```jsonc
+{
+  "maxion-game-back-office": [
+    "launcher-game-releases@mu-maxage",   // scoped to one game tenant
+    "launcher-game-releases@snake",       // …and another
+    "launcher-analytics"                  // unqualified
+  ]
+}
+```
+
+**This changes nothing in this contract.** `siteAccess` is still
+`Record<site, string[]>`, normalisation is still sort-dedupe over opaque
+strings, and rule 3 still matches by plain string equality. Neither
+implementation splits on `@`, prefix-matches, or otherwise gives the separator
+meaning — the six `qualified-*` cases in `cases.json` exist to keep it that
+way, and they pass against the pre-existing code unchanged.
+
+Two consequences follow directly from equality-matching, and both are
+deliberate:
+
+1. **An unqualified requirement is NOT satisfied by a qualified grant.**
+   `has_feature(site, "launcher-coupons")` is `false` for an admin holding only
+   `launcher-coupons@mu-maxage`. A service that has not been taught the
+   qualifier vocabulary therefore refuses rather than over-grants — a partial
+   rollout across the fleet fails **closed**.
+2. **A qualified requirement is NOT satisfied by an unqualified grant.** A
+   service must never widen a bare grant by guessing qualifiers; if it wants
+   "bare means all", that is a rule the *service* implements on top of the
+   grants this contract hands it, not something this contract does for it.
+
+Super admins bypass both, per rule 3, and never need qualified grants minted.
+
+**What owns the qualifier vocabulary.** This contract does not: it neither
+validates nor interprets the text after `@`. The IdP
+(`maxgame-admin-auth-server`) decides which feature keys may be qualified and
+what a qualifier may look like, and the enforcing service decides what it
+means. Today exactly one vocabulary exists — game tenants on the four
+tenant-scoped launcher keys (`launcher-games`, `launcher-maintenance`,
+`launcher-coupons`, `launcher-game-releases`), enforced by
+`maxgame-launcher-backend`. A second vocabulary would need no change here
+either, which is the point.
+
 ## Known gap: a JWKS with duplicate `kid`s
 
 Not covered by a case yet, and the two implementations disagree — recorded here

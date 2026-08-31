@@ -318,6 +318,49 @@
       "method": "GET", "require": { "site": "mu-back-office", "feature": "news-management" },
       "token": { "sub": "6c7b84de-9e3d-40ef-97eb-6bd47ae170a5", "role": "super_admin", "type": "admin", "siteAccess": {}, "valid": true },
       "expect": { "status": 200, "context": { "adminId": "6c7b84de-9e3d-40ef-97eb-6bd47ae170a5", "adminRole": "super_admin", "adminSiteAccessPresent": true } }
+    },
+
+    {
+      "id": "qualified-grant-does-not-satisfy-base-feature-403",
+      "why": "Qualified grants (`feature@qualifier`, see README 'Qualified grants') are opaque strings to this contract — an exact string match, nothing more. A service that has not yet been taught the qualifier vocabulary must therefore refuse an admin who only holds a qualified grant, rather than accept them as if the grant were unqualified. This is the load-bearing case for the whole scheme: it is what makes a partial rollout fail CLOSED across the fleet.",
+      "method": "GET", "require": { "site": "maxion-game-back-office", "feature": "launcher-coupons" },
+      "token": { "role": "admin", "type": "admin", "siteAccess": { "maxion-game-back-office": ["launcher-coupons@mu-maxage"] }, "valid": true },
+      "expect": { "status": 403, "reasonContains": "feature" }
+    },
+    {
+      "id": "qualified-grant-matches-itself-verbatim-ok",
+      "why": "The other half of the same rule: a service that DOES require the qualified key gets it by plain string equality, with no splitting, no prefix matching and no special-casing of the separator anywhere in this library.",
+      "method": "GET", "require": { "site": "maxion-game-back-office", "feature": "launcher-coupons@mu-maxage" },
+      "token": { "role": "admin", "type": "admin", "siteAccess": { "maxion-game-back-office": ["launcher-coupons@mu-maxage"] }, "valid": true },
+      "expect": { "status": 200 }
+    },
+    {
+      "id": "unqualified-grant-does-not-satisfy-qualified-requirement-403",
+      "why": "Symmetric to the two cases above, and the reason a service must never 'widen' an unqualified grant by guessing qualifiers: matching is equality in BOTH directions.",
+      "method": "GET", "require": { "site": "maxion-game-back-office", "feature": "launcher-coupons@mu-maxage" },
+      "token": { "role": "admin", "type": "admin", "siteAccess": { "maxion-game-back-office": ["launcher-coupons"] }, "valid": true },
+      "expect": { "status": 403 }
+    },
+    {
+      "id": "qualified-grants-normalise-sorted-and-deduped",
+      "why": "Normalisation must treat a qualified grant as an ordinary string: sorted, deduped, order-independent. If the separator were ever given meaning inside normalisation, this case would start behaving differently from `grants-order-independent`.",
+      "method": "GET", "require": { "site": "maxion-game-back-office", "feature": "launcher-game-releases@snake" },
+      "token": { "role": "admin", "type": "admin", "siteAccess": { "maxion-game-back-office": ["launcher-game-releases@snake", "launcher-coupons@mu-maxage", "launcher-game-releases@snake"] }, "valid": true },
+      "expect": { "status": 200 }
+    },
+    {
+      "id": "super-admin-bypasses-qualified-requirement",
+      "why": "Rule 3 is unconditional: `role == super_admin` satisfies every check, including one whose required key carries a qualifier. A super admin must never need qualified grants minted for them.",
+      "method": "GET", "require": { "site": "maxion-game-back-office", "feature": "launcher-coupons@mu-maxage" },
+      "token": { "role": "super_admin", "type": "admin", "siteAccess": {}, "valid": true },
+      "expect": { "status": 200, "introspectCalled": false }
+    },
+    {
+      "id": "qualified-legacy-object-shape-reads-keys",
+      "why": "The legacy `{feature: 'edit'}` shape yields its KEYS as grants; a qualified key inside that shape must behave exactly like one inside an array. Pinned so nobody 'optimises' the object branch into treating values as qualifiers.",
+      "method": "GET", "require": { "site": "maxion-game-back-office", "feature": "launcher-coupons@mu-maxage" },
+      "token": { "role": "admin", "type": "admin", "siteAccess": { "maxion-game-back-office": { "launcher-coupons@mu-maxage": "edit" } }, "valid": true },
+      "expect": { "status": 200 }
     }
   ]
 }
