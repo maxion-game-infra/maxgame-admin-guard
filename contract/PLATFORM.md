@@ -275,7 +275,7 @@ deployed, so this is free to change.
 | `keyServer` | 8090 | `/healthz` | `/readyz` (**dev.sh gates boot on this one deliberately** — see below) | `maxgame-key-server` |
 | `authServer` | 4000 | `/healthz` | `/readyz` | `maxgame-auth-server` |
 | `launcher` | 8092 | `/healthz` | `/readyz` | `maxgame-launcher-backend` |
-| `news` | 8093 | `/healthz` | `/readyz` (**waits on a background migration** — see below) | `maxgame-news-backend` |
+| `news` | 8093 | `/healthz` | `/readyz` | `maxgame-news-backend` |
 | `web` | 8094 | `/healthz` | `/readyz` | `maxgame-web-backend` |
 | `utility` | 8095 | `/healthz` | `/readyz` | `maxgame-utility-server` |
 | `mailer` | 8096 | `/healthz` | `/readyz` | `maxgame-mail-server` (also serves the legacy `/health` at root, because the Node relay's clients and its runbooks use that path — additive, not a replacement) |
@@ -352,13 +352,14 @@ the *body* shape doesn't require migrating that caller off the old path.
 Source: `web-platform-backend/src/app.controller.ts`.
 
 `dev.sh` gates `make up` on `/healthz` for every service *except*
-`key-server`, which it gates on `/readyz` on purpose (comment at
-`dev.sh:24-32`): `news` applies its migrations in the background and reports
-unready until they land, so gating the whole stack's boot on `/readyz` would
-stall unrelated services behind one service's schema work, and the 60s
-`wait_healthy` timeout would then fail services that have nothing to do with
-the slow migration. This is a documented, intentional divergence — not a bug
-to fix in M2.
+`key-server`, which it gates on `/readyz`. The original reason for that split
+is gone: `news` used to apply its migrations in a background task and report
+unready until they landed, so gating the stack's boot on `/readyz` would have
+stalled unrelated services behind one service's schema work. Since §3.7 no
+service migrates itself and every `/readyz` is a plain dependency ping, so
+either path would work. `/healthz` remains the default because it answers the
+narrower question that gate is asking — "did the process come up" — and
+`key-server` is left on `/readyz` rather than churned for symmetry.
 
 ### 3.2 CORS
 
@@ -754,7 +755,62 @@ Normative rules, extracted from the above rather than invented:
    non-numeric value for their respective rate-limit env vars and assert the
    boot fails naming that variable.
 
-### 3.7 An applied migration is frozen — **including its comments**
+### 3.7 Migrations: applied deliberately, never on boot
+
+**No service migrates its own database at startup.** Applying the schema is a
+separate step an operator runs; the binary's only job is to refuse to start if
+the schema is behind what it was built against.
+
+Three things forced this, and each is a property of the k8s target rather than
+a preference:
+
+1. A pod that migrates on boot mutates the schema **while older pods are still
+   serving old code against it** during a rolling update. That is safe only
+   under expand/contract discipline, and nothing enforces it.
+2. It requires the runtime credential to hold DDL rights, so the process
+   serving traffic can drop tables.
+3. A failed migration presents as `CrashLoopBackOff` rather than "the
+   migration failed", which is a materially worse thing to be paged for.
+
+**The rules:**
+
+- No `sqlx::migrate!().run()` (or equivalent) reachable from the **server
+  binary**. A dedicated setup tool may still apply migrations — `idp`'s
+  `src/bin/seed_admin.rs` does, so a fresh database can be brought up without
+  the server having started — but nothing on the serving path may, and an
+  unreachable `migrate()` helper left behind in the crate counts as a
+  violation rather than a harmless leftover: it is the thing someone wires
+  back into boot later because it was already there.
+- Every repo with migrations ships **`scripts/migrate.sh`** — the same thin
+  wrapper around `sqlx migrate run` in each, resolving `DATABASE_URL` from the
+  environment and falling back to the repo's `.env`, failing loudly if unset.
+  Identical in shape across the fleet so an operator runs one command
+  everywhere.
+- Every such service runs a **boot-time schema-version guard**: compare the
+  highest embedded migration version against `SELECT max(version) FROM
+  _sqlx_migrations`; outside development, refuse to boot when the database is
+  behind, naming both the expected and the found version. **Every uncertain
+  case — table missing, query error, timeout — counts as "cannot confirm" and
+  fails the same way.** In development, warn instead of refusing.
+- **Connectivity may retry; a behind schema may not.** An unreachable database
+  at boot is transient and a short retry window is appropriate (`news` and
+  `launcher` carry one because their databases are off-box, and they
+  previously relied on a retrying background migrator to survive exactly this).
+  A schema confirmed behind is not transient, so it fails fast.
+- `/readyz` does **not** re-check the migration version. The guard settles that
+  question once at boot, so a running process has a current schema by
+  construction; readiness is a plain dependency ping.
+
+Reference implementation: `maxgame-key-server/src/infrastructure/boot.rs`
+(`check_schema_version`) — it worked this way before the rest of the fleet and
+is what the others were ported from.
+
+Local development is unaffected: `back-office-workspace/.scripts/dev.sh`
+applies every repo's migrations (`make migrate`, also run by `make up`) before
+starting any service, discovering them by looking for `scripts/migrate.sh`
+rather than a hardcoded list.
+
+### 3.8 An applied migration is frozen — **including its comments**
 
 `sqlx migrate run` checksums the **whole file**, comments included, and refuses
 with `migration N was previously applied but has been modified`. A one-line
@@ -1359,6 +1415,14 @@ several items below apply to it only partially, per its own documented and
 open exceptions — see **authServer specifically** at the end of this
 section rather than assuming every bullet below applies unmodified.
 
+- [ ] No `sqlx::migrate!().run()` reachable from the server binary, and no
+      unreachable `migrate()` helper left in the crate (§3.7 — a dedicated
+      setup tool such as `idp`'s `seed_admin` bin is the one exception); a
+      repo with migrations ships `scripts/migrate.sh` and refuses to boot
+      outside
+      development when `_sqlx_migrations` is behind the embedded version,
+      naming both versions — and treats a missing table, a query error and a
+      timeout identically as "cannot confirm".
 - [ ] Every error response is `{statusCode, message, error}` (§1.1); a 500's
       `message` is always exactly `"Internal server error"`; a 429 (where
       applicable) carries `Retry-After` in seconds.
