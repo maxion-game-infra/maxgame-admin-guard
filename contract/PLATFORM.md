@@ -280,11 +280,21 @@ deployed, so this is free to change.
 | `utility` | 8095 | `/healthz` | `/readyz` | `maxgame-utility-server` |
 | `mailer` | 8096 | `/healthz` | `/readyz` | `maxgame-mail-server` (also serves the legacy `/health` at root, because the Node relay's clients and its runbooks use that path — additive, not a replacement) |
 | `api` | 8080 | `/healthz` (`/health` kept as a legacy alias) | `/readyz` | `web-platform-backend` (being retired) |
+| `shop` | 8100 | `/healthz` | `/readyz` (gated on this one, like `keyServer`: it fronts `maxgame-plaza` and a pool that cannot answer is not a service that can sell anything) | `maxgame-shop-server` |
 | SPA | 5173 | `/` | — | `web-platform-back-office` |
 
-Source: `back-office-workspace/.scripts/dev.sh:34-44` (`SERVICES` array,
-which is the definition of "does the local stack boot" — every port above
-was read straight out of it, not inferred).
+Source: `back-office-workspace/.scripts/dev.sh` (`SERVICES` array, which is
+the definition of "does the local stack boot").
+
+🔴 **The port column above is stale for the first four rows and was corrected
+against `dev.sh` on 2026-09-09 rather than re-copied.** What that array
+actually says today is `idp` **8090**, `authServer` **8091**, `keyServer`
+**8092**, `launcher` **8093**, `news` **8094**, `web` **8095**, `utility`
+**8096**, `mailer` **8097**, `mu-preregister` **8098**, `shop` **8100** —
+with **8099 taken by DbGate**, which is why the newest service is not 8099.
+`01.back-office/FLEET.md` carries the same table and is the one that has been
+kept accurate; prefer it, and treat a port read from here as needing a check
+until the rest of this table is fixed in a pass of its own.
 
 **Rule**: every service serves `/healthz` (liveness — "did the process come
 up") and `/readyz` (readiness — "can serve traffic") **at the root**, always,
@@ -888,6 +898,7 @@ nests its whole router under it (axum `Router::nest(base_path, app)`).
 | `/utility` | `utility` | `maxgame-utility-server` (also mounts the bucket registry admin CRUD — `POST/GET /v1/admin/buckets`, `GET /v1/admin/buckets:active`, `GET/PATCH/DELETE /v1/admin/buckets/{id}`, super_admin only) |
 | `/platform` | `api` | `web-platform-backend` (temporary — strip-prefix at the ingress instead of a code change, since this service is being retired) |
 | `/mailer` | `mailer` | `maxgame-mail-server` (the Rust port of `maxgame-email-server-legacy`; port 8096, `BASE_PATH=/mailer`, no ingress rewrite. Replaces the old "stays on Cloud Run" row — the Node service on `mailer.*` is retired at cutover. See its exceptions in §1.5 and §2.4) |
+| `/shop` | `shop` | `maxgame-shop-server` (the adapter in front of `maxgame-plaza` for top-up, the in-game cash shop and, later, the marketplace — for several games at once. **Two lanes on one base path**: `/shop/v1/admin/*` takes an admin JWT, `/shop/v1/game/*` takes an `mxs_` service key verified at `maxgame-key-server` and pinned to the `{game}` in the path. Its admin grants are tenant-scopable — `shop-topup-catalogue@mu-maxage` — so the shared verifier's equality match does not satisfy them and it resolves the qualifier itself, the way `maxgame-launcher-backend` does) |
 
 ### 5.2 `BASE_PATH` contract
 
