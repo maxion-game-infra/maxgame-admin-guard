@@ -1,0 +1,108 @@
+# ci workflow TEMPLATE — THE PULL-REQUEST GATE. Copy to <app-repo>/.github/workflows/ci.yml
+# and replace <APP_REPO> with the repo directory name.
+#
+# ⛔⛔ **WHY EVERY APP REPO NEEDS THIS, AND WHY THE TEMPLATE DID NOT HAVE IT UNTIL NOW.**
+# *Measured 2026-09-17 (`W283`): this pack shipped `deploy-dev.yml` and `ci-image.Dockerfile` and
+# **no pull-request workflow at all**, so every repo that followed it faithfully had no mechanical
+# gate in front of a merge. The sweep found the three without one were `admin-auth`, `auth-server`
+# and `key-server` — **the entire credential-issuance layer**: admin tokens, player tokens and
+# `mxs_` service keys. The five repos that DID have a `ci.yml` had acquired it some other way.*
+#
+# ⭐ **What the absence cost, concretely:** *`admin-auth`'s `check-no-test-endpoints.sh` — the
+# control proving a credential-minting route is compiled OUT of a default build — was added on
+# 2026-09-12 and **ran for the first time on 2026-09-17**, when a tag was cut. It failed
+# immediately (`W282`). Five days of `develop` held a guard nobody had executed, and a green merge
+# carried no information.*
+#
+# ⛔ **The tag-time gate in `deploy-dev.yml` is NOT a substitute and that is the whole point.** *It
+# works — it is what caught `W282` — but it catches at RELEASE, so the cost lands as a failed
+# release and a spent version number rather than as a red PR. `dev-v0.1.20` and `dev-v0.1.21` were
+# both burned that way in one afternoon.*
+#
+# ⚠️ **This file runs the SAME `scripts/ci.sh` the tag-time `test` job runs, deliberately.** *Two
+# gates that run different things is how one of them becomes the trusted one and the other rots. If
+# the gate needs to change, change `scripts/ci.sh`.*
+name: ci
+
+on:
+  pull_request:
+
+# ⛔⛔ **THE SAME GROUP AS `deploy-dev`, AND IT MUST STAY THAT WAY — THIS IS A CORRECTNESS
+# CONSTRAINT, NOT A SPEED ONE.** *`deploy-dev.yml`'s own note: "the test job's Postgres service
+# container and the runner's Docker/AR auth are shared per-runner resources, and two app repos
+# tagging at once would otherwise race here." **This job uses that same Postgres and the same
+# `/ci-target` cache volume**, so it has to serialize against deploys and against the other repos'
+# test jobs — a PR gate that corrupts a release's cache is worse than no PR gate.*
+#
+# ⛔ **`cancel-in-progress` MUST be `false` here.** *In a SHARED group, `true` would let a pull
+# request cancel a running DEPLOY. The cost of `false` is that a PR gate queues behind a release,
+# which is the right way round.*
+#
+# ⚠️ *If PR latency becomes the problem, the fix is a SEPARATE cache volume and a separate Postgres
+# service — not `cancel-in-progress: true` and not a different group while the resources are shared.*
+concurrency:
+  group: deploy-dev
+  cancel-in-progress: false
+
+env:
+  # This repo's own directory name. Used as the checkout `path:` and as the
+  # working directory for `scripts/ci.sh`.
+  REPO_DIR: <APP_REPO>
+  # ⛔ Pin the guard commit, for the SAME reason `deploy-dev.yml` pins it: `actions/checkout` with
+  #    no `ref:` takes the guard's default branch, so an unpinned gate tests against whatever
+  #    landed on `main` since. ⚠️ **Bump this together with BOTH deploy workflows** — a PR gate
+  #    that compiles against a different guard commit than the release proves nothing about it.
+  GUARD_REF: 04f8cd60e93edb14e17d7f28219a32d8c2dcf85c
+
+jobs:
+  test:
+    runs-on: [self-hosted, Linux, X64, office]
+    container:
+      # Prebaked on the runner (maxgame-admin-guard template/ci/ci-image.Dockerfile), served from
+      # the runner's own localhost:5000 registry — no Docker Hub pull, no quota.
+      image: localhost:5000/maxgame-ci-rust:1.97
+      volumes:
+        # ⚠️ The SAME persistent caches `deploy-dev` uses — see the concurrency note above for why
+        #    sharing them is safe only while both workflows are in one group.
+        - /home/maxiongame/ci-cache/cargo-registry:/usr/local/cargo/registry
+        - /home/maxiongame/ci-cache/target/${{ github.event.repository.name }}:/ci-target
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_PASSWORD: ci
+    steps:
+      - name: Checkout ${{ env.REPO_DIR }}
+        uses: actions/checkout@v4
+        with:
+          path: ${{ env.REPO_DIR }}
+
+      # Sibling layout so the Cargo path-dep `../maxgame-admin-guard/rust` resolves exactly as it
+      # does in local dev and in the Dockerfile. `fetch-depth: 0` because `ref:` is a full SHA.
+      - name: Checkout maxgame-admin-guard
+        uses: actions/checkout@v4
+        with:
+          repository: maxion-game-infra/maxgame-admin-guard
+          ref: ${{ env.GUARD_REF }}
+          fetch-depth: 0
+          path: maxgame-admin-guard
+
+      # ⛔ TEST_DATABASE_URL is the ONLY db env var this sets. Never DATABASE_URL or
+      #    MIGRATION_DATABASE_URL, never a .env file — `ci.sh` reads exclusively from
+      #    TEST_DATABASE_URL and refuses anything but a local host, precisely so this cannot
+      #    drift onto a pooled or deployed database.
+      - name: Run scripts/ci.sh
+        working-directory: ${{ env.REPO_DIR }}
+        env:
+          TEST_DATABASE_URL: postgres://postgres:ci@postgres:5432/postgres
+          # Build artifacts land on the mounted per-repo host volume so they survive between runs.
+          # ⚠️ `scripts/check-no-test-endpoints.sh` READS this — see `W282`: it used to hardcode
+          #    `target/debug` and silently measured a stale artefact on any machine that had one.
+          CARGO_TARGET_DIR: /ci-target
+        run: ./scripts/ci.sh
+
+      # This job runs in a container as root while other jobs run on the host as uid 1000 sharing
+      # the same _work directory — without this, their checkout cleanup dies with EACCES.
+      - name: Fix workspace ownership for host jobs
+        if: always()
+        run: chown -R 1000:1000 "$GITHUB_WORKSPACE"
