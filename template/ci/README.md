@@ -1,4 +1,28 @@
-# `deploy-dev.yml` — copy-per-repo CI/CD template
+# Copy-per-repo CI/CD templates
+
+**Two files, and they gate at different moments. A repo needs BOTH.**
+
+| file | trigger | what it is |
+|---|---|---|
+| [`ci.yml`](./ci.yml) | `pull_request` | ⭐ **the PR gate** — runs `scripts/ci.sh` before a merge |
+| [`deploy-dev.yml`](./deploy-dev.yml) | `push: tags: dev-v*` | the release, with the same `ci.sh` as its gate |
+
+⛔⛔ **`ci.yml` WAS MISSING FROM THIS PACK UNTIL 2026-09-17, AND ITS ABSENCE IS `W283`.** *Every repo
+that followed this template faithfully therefore had **no mechanical gate in front of a merge** —
+and the three found without one were `admin-auth`, `auth-server` and `key-server`, the entire
+credential-issuance layer. ⭐ **The cost, measured:** `admin-auth`'s `check-no-test-endpoints.sh`,
+the control proving a credential-minting route is compiled out of a default build, sat on `develop`
+for five days and first ran when a tag was cut — where it failed (`W282`), burning two version
+numbers instead of showing one red PR.
+
+⚠️ **Copy `ci.yml` at the same time as `deploy-dev.yml`.** *They share the runner's Postgres service
+and `/ci-target` cache volume, so `ci.yml` deliberately joins the **same `deploy-dev` concurrency
+group** — see its own header. A repo with only the deploy workflow is the state this finding is
+about.*
+
+---
+
+## `deploy-dev.yml`
 
 Canonical source: [`deploy-dev.yml`](./deploy-dev.yml) in this directory. Every
 Rust backend that deploys to the office k3s dev cluster gets its own **copy**
