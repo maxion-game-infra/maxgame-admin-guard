@@ -23,9 +23,24 @@ the fourth implementation does not have to be written from scratch.
 3. **Authorization** — `role == "super_admin"` satisfies every check.
    Otherwise the required feature key must appear in `siteAccess[site]`.
 4. **Live introspection on mutations** — `POST {idp}/api/v1/oauth/introspect`
-   with header `x-api-key` for `POST|PUT|PATCH|DELETE`. The verdict's `role` and
-   `siteAccess` **replace** the token's before the authorization decision.
-   `GET|HEAD|OPTIONS` never introspect.
+   with header `x-api-key` for `POST|PUT|PATCH|DELETE`. `GET|HEAD|OPTIONS`
+   never introspect. **The order is fixed** (ruled 2026-10-19, W368 option A):
+   1. offline verification (rule 2);
+   2. every refusal the **signed claims** alone decide: a route with no
+      site/feature requirement, empty access (rule 6), and the site/feature
+      check (rule 3). A request refused here is **never introspected**.
+      ⚠️ *Exception:* the JS NestJS `AdminAuthGuard` is given no route
+      `require`, so it refuses guest/empty access here but checks
+      site/feature only AFTER introspection (`js/src/nest/admin-auth.guard.ts`);
+   3. only for a request that passed: introspection. The verdict's `role` and
+      `siteAccess` **replace** the token's, and step 2's checks run again
+      against them.
+
+   A `super_admin` token passes step 2 and is still introspected. So a
+   revocation or a removed grant takes effect on the next write, while a
+   grant or a promotion added after the token was minted reaches writes only
+   once the token is refreshed (up to one access-token lifetime), the same as
+   on reads. The cases `write-*-without-introspect` pin the order.
 5. **Fail closed, with the status distinguishing the cause** — a verdict of
    `active:false` is 401; a failure to obtain a verdict at all (timeout,
    network, non-2xx, open breaker, malformed body) is 503. These must not

@@ -1,4 +1,4 @@
-import { checkAdminScope, verifyAdminAuth } from '../core/authorize';
+import { verifyAdminAuth } from '../core/authorize';
 import { AdminGuardError } from '../core/errors';
 import { AdminIntrospectClient } from '../core/introspect-client';
 import { AdminJwtVerifier } from '../core/jwt-verifier';
@@ -45,18 +45,15 @@ export async function authorizeAdminRequest(
   },
   options: { require?: RequireScope; allowNoAccess?: boolean } = {},
 ): Promise<AdminAuthContext> {
-  const ctx = await verifyAdminAuth(
+  return verifyAdminAuth(
     {
       method: req.method ?? 'GET',
       authorizationHeader: headerValue(req.headers['authorization']),
       allowNoAccess: options.allowNoAccess,
+      require: options.require,
     },
     deps,
   );
-  if (options.require !== undefined) {
-    checkAdminScope(ctx, options.require);
-  }
-  return ctx;
 }
 
 export type AdminAuthMiddlewareOptions = {

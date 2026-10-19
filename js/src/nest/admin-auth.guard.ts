@@ -11,10 +11,15 @@ import { toNestException } from './exceptions';
 
 /**
  * Verifies admin access tokens against the standalone IdP. Every request
- * gets offline JWKS verification (signature/issuer/expiry/`type`); mutating
- * requests additionally get a live introspect call so a deactivation or a
- * site/feature change takes effect on the very next mutation instead of
- * waiting for the access token to expire. Sets `req.adminId` / `adminRole` /
+ * gets offline JWKS verification (signature/issuer/expiry/`type`) and the
+ * no-access check on the token's claims; mutating requests that pass
+ * additionally get a live introspect call so a deactivation or a removed
+ * grant takes effect on the very next mutation instead of waiting for the
+ * access token to expire. A grant ADDED after the token was minted does not
+ * reach writes until a refresh (contract rule 4, W368 option A). This guard
+ * passes no `require` to {@link verifyAdminAuth}, so a token on the wrong
+ * site is still introspected here and refused afterwards by
+ * `AdminBackOfficeFeatureGuard`. Sets `req.adminId` / `adminRole` /
  * `adminSiteAccess` for downstream guards/controllers/audit logging.
  */
 @Injectable()
