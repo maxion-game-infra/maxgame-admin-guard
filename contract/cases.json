@@ -162,19 +162,43 @@
     },
     {
       "id": "write-live-verdict-grants-beyond-token",
-      "why": "Symmetric case: a grant added after the token was minted takes effect on the next write, without a refresh.",
+      "why": "INVERTED 2026-10-19, ruled by Nipon (W368, option A). Refusals that the signed claims alone decide run BEFORE introspection, so a grant added after the token was minted does not reach writes until the token is refreshed: up to one access-token lifetime, the same as on reads. The token holds the site with no features, so the feature check refuses it from the token and the IdP is never asked. Until this date the case expected 200 (the grant applied on the next write without a refresh). The id is kept because ids are stable.",
       "method": "POST", "require": { "site": "zone4-back-office", "feature": "presale-stock" },
       "token": { "role": "admin", "type": "admin", "siteAccess": { "zone4-back-office": [] }, "valid": true },
       "introspect": { "active": true, "adminId": "x", "role": "admin", "siteAccess": { "zone4-back-office": ["presale-stock"] }, "tokenVersion": 0 },
-      "expect": { "status": 200 }
+      "expect": { "status": 403, "reasonContains": "feature", "introspectCalled": false }
     },
     {
       "id": "write-live-role-promotion-honoured",
-      "why": "A live super_admin verdict bypasses features even when the token says otherwise.",
+      "why": "INVERTED 2026-10-19, ruled by Nipon (W368, option A). A promotion to super_admin after the token was minted does not reach writes until the token is refreshed: up to one access-token lifetime, the same as on reads. The token holds no site at all, so the empty-access check (rule 6) refuses it from the token and the IdP is never asked. Until this date the case expected 200 (the live super_admin verdict was honoured). The id is kept because ids are stable, even though it now names the behaviour that was ruled out.",
       "method": "DELETE", "require": { "site": "mu-back-office", "feature": "news-management" },
       "token": { "role": "admin", "type": "admin", "siteAccess": {}, "valid": true },
       "introspect": { "active": true, "adminId": "x", "role": "super_admin", "siteAccess": {}, "tokenVersion": 0 },
-      "expect": { "status": 200 }
+      "expect": { "status": 403, "reasonContains": "No access assigned", "introspectCalled": false }
+    },
+    {
+      "id": "write-guest-token-refused-without-introspect",
+      "why": "W368: the IdP auto-provisions any Google-verified account as role guest with no grants, and that token is real, signed and type admin. A write carrying it is refused from the signed claims, with ZERO introspect calls. The IdP is stubbed to time out, so a guard that still asked would answer 503 here, not 403.",
+      "method": "POST", "require": { "site": "zone4-back-office", "feature": "presale-stock" },
+      "token": { "role": "guest", "type": "admin", "siteAccess": {}, "valid": true },
+      "introspect": { "transport": "timeout" },
+      "expect": { "status": 403, "reasonContains": "No access assigned", "introspectCalled": false }
+    },
+    {
+      "id": "write-wrong-site-refused-without-introspect",
+      "why": "W368: a token whose grants are all on another site is refused from the signed claims, with ZERO introspect calls. The IdP is stubbed to answer 500, so a guard that still asked would answer 503 here, not 403.",
+      "method": "PUT", "require": { "site": "mu-back-office", "feature": "news-management" },
+      "token": { "role": "admin", "type": "admin", "siteAccess": { "zone4-back-office": ["news-management"] }, "valid": true },
+      "introspect": { "transport": "http", "status": 500 },
+      "expect": { "status": 403, "reasonContains": "feature", "introspectCalled": false }
+    },
+    {
+      "id": "write-missing-scope-metadata-refused-without-introspect",
+      "why": "W368: a mutating route wired with no site/feature requirement is refused before introspection, the same as on a read. The IdP is stubbed to time out, so a guard that still asked would answer 503 here, not 403.",
+      "method": "POST", "require": null,
+      "token": { "role": "admin", "type": "admin", "siteAccess": { "mu-back-office": ["news-management"] }, "valid": true },
+      "introspect": { "transport": "timeout" },
+      "expect": { "status": 403, "introspectCalled": false }
     },
     {
       "id": "write-inactive-401",

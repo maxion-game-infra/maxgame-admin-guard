@@ -1,9 +1,11 @@
 /**
  * Drives every case in `../../contract/cases.json` through the real core
- * verifier (`AdminJwtVerifier` + `AdminIntrospectClient` + `verifyAdminAuth`
- * + `checkAdminScope`) — not a reimplementation of the rules, the actual
- * production code path, with introspection stubbed per case and a fake
- * clock for the breaker's `sequence` cases. See contract/README.md.
+ * verifier (`AdminJwtVerifier` + `AdminIntrospectClient`, entered through the
+ * middleware's framework-free `authorizeAdminRequest`, which calls
+ * `verifyAdminAuth` with the case's `require`) — not a reimplementation of
+ * the rules, the actual production code path, with introspection stubbed per
+ * case and a fake clock for the breaker's `sequence` cases. See
+ * contract/README.md.
  */
 import { readFileSync } from 'node:fs';
 import * as http from 'node:http';
@@ -14,13 +16,13 @@ import { fileURLToPath } from 'node:url';
 import * as jose from 'jose';
 import { describe, expect, it, vi } from 'vitest';
 
-import { checkAdminScope, verifyAdminAuth } from '../src/core/authorize';
 import { AdminGuardError } from '../src/core/errors';
 import { AdminIntrospectClient } from '../src/core/introspect-client';
 import type { IntrospectTransport } from '../src/core/introspect-client';
 import { AdminJwtVerifier } from '../src/core/jwt-verifier';
 import type { JwksResolver } from '../src/core/jwt-verifier';
 import type { RequireScope } from '../src/core/types';
+import { authorizeAdminRequest } from '../src/middleware';
 
 const dirname = path.dirname(fileURLToPath(import.meta.url));
 const CONTRACT_DIR = path.resolve(dirname, '../../contract');
@@ -246,14 +248,14 @@ async function runRequest(
   const jwksCallsBefore = jwksSpy.mock.calls.length;
 
   try {
-    const ctx = await verifyAdminAuth(
+    const ctx = await authorizeAdminRequest(
       {
         method,
-        authorizationHeader: rawToken ? `Bearer ${rawToken}` : null,
+        headers: { authorization: rawToken ? `Bearer ${rawToken}` : undefined },
       },
       { jwtVerifier, introspectClient, mutatingMethods },
+      { require },
     );
-    checkAdminScope(ctx, require);
     return {
       status: 200,
       introspectCalled: transportSpy.mock.calls.length > transportCallsBefore,

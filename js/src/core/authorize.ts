@@ -7,7 +7,7 @@ import {
 import { AdminGuardError } from './errors';
 import type { AdminIntrospectClient } from './introspect-client';
 import type { AdminJwtVerifier } from './jwt-verifier';
-import type { AdminAuthContext, RequireScope } from './types';
+import type { AdminAuthContext, AdminSiteAccess, RequireScope } from './types';
 import { isActiveIntrospection, DEFAULT_MUTATING_METHODS } from './types';
 
 export type VerifyAdminAuthInput = {
@@ -20,6 +20,15 @@ export type VerifyAdminAuthInput = {
    * rejected with 403. Mirrors `@AdminAuth({ allowNoAccess: true })`.
    */
   allowNoAccess?: boolean;
+  /**
+   * The route's site/feature requirement. When given (including `null`,
+   * which means "wired without metadata" and refuses), it is checked
+   * against the token's signed claims BEFORE introspection and against the
+   * live verdict after it. Omit it only if the caller runs
+   * {@link checkAdminScope} itself, as `AdminBackOfficeFeatureGuard` does;
+   * an omitted scope gets no pre-introspection site/feature refusal.
+   */
+  require?: RequireScope;
 };
 
 export type VerifyAdminAuthDeps = {
@@ -36,16 +45,20 @@ function extractBearerToken(
 }
 
 /**
- * The admin-auth contract's core decision (contract rules 1-6, 8), minus the
- * per-route site/feature check (see {@link checkAdminScope}) — this split
- * mirrors the two guards `AdminAuthGuard` + `AdminBackOfficeFeatureGuard`
- * historically applied in sequence, and lets a caller that only needs
- * "is this a valid admin" skip scope entirely.
+ * The admin-auth contract's core decision (contract rules 1-6, 8), plus the
+ * per-route site/feature check (see {@link checkAdminScope}) when
+ * `input.require` is given. A caller that only needs "is this a valid
+ * admin" omits `require`; `AdminAuthGuard` + `AdminBackOfficeFeatureGuard`
+ * still apply the two halves in sequence.
  *
- * Every request: offline JWKS verification + `type === 'admin'`. Mutating
- * requests additionally: live introspect, whose verdict REPLACES the
- * token's own (up to token-lifetime-stale) role/siteAccess before the
- * no-access check runs (contract case `write-live-verdict-overrides-token-grant`).
+ * Every request: offline JWKS verification + `type === 'admin'`, then the
+ * no-access check and (if `require` is given) the scope check on the
+ * token's signed claims. Mutating requests that pass additionally: live
+ * introspect, whose verdict REPLACES the token's own (up to
+ * token-lifetime-stale) role/siteAccess, and the same checks again on the
+ * verdict (contract case `write-live-verdict-overrides-token-grant`). A
+ * request the signed claims refuse is never introspected (rule 4, W368
+ * option A; contract cases `write-*-without-introspect`).
  */
 export async function verifyAdminAuth(
   input: VerifyAdminAuthInput,
@@ -64,6 +77,8 @@ export async function verifyAdminAuth(
 
   let role = decoded.role;
   let siteAccess = normalizeAdminSiteAccess(decoded.siteAccess);
+
+  checkAccess(input, decoded.sub, role, siteAccess);
 
   const mutating = new Set(deps.mutatingMethods ?? DEFAULT_MUTATING_METHODS);
   if (mutating.has(input.method)) {
@@ -85,16 +100,37 @@ export async function verifyAdminAuth(
         `Admin session is no longer active (${verdict.reason})`,
       );
     }
+
+    checkAccess(input, decoded.sub, role, siteAccess);
   }
 
+  return { adminId: decoded.sub, adminRole: role, adminSiteAccess: siteAccess };
+}
+
+/**
+ * Contract rule 6, then (if `input.require` is given) rule 3.
+ * {@link verifyAdminAuth} runs it on the signed claims and, on a mutation,
+ * again on the live verdict, so both passes refuse with the same status and
+ * message.
+ */
+function checkAccess(
+  input: VerifyAdminAuthInput,
+  adminId: string,
+  role: string,
+  siteAccess: AdminSiteAccess,
+): void {
   if (!input.allowNoAccess && !adminHasAnySiteAccess(role, siteAccess)) {
     throw new AdminGuardError(
       403,
       'No access assigned. Contact your administrator.',
     );
   }
-
-  return { adminId: decoded.sub, adminRole: role, adminSiteAccess: siteAccess };
+  if (input.require !== undefined) {
+    checkAdminScope(
+      { adminId, adminRole: role, adminSiteAccess: siteAccess },
+      input.require,
+    );
+  }
 }
 
 /**

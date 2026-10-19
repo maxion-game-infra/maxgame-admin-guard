@@ -210,13 +210,17 @@ impl AdminGuard {
     /// 1. Refuse outright if this guard is not configured (rule 8).
     /// 2. Require a bearer credential (rule 1).
     /// 3. Verify it offline against the JWKS (rule 2).
-    /// 4. On a mutating method, replace role/grants with a live
+    /// 4. Refuse a route with no site/feature requirement wired at all.
+    /// 5. Run `check_access` against the token's own signed claims.
+    ///    On a mutating method this happens before introspection, so a
+    ///    request the token alone refuses never reaches the IdP (rule 4,
+    ///    W368 option A; contract cases `write-*-without-introspect`).
+    /// 6. On a mutating method, replace role/grants with a live
     ///    introspection verdict (rule 4); an inactive verdict is 401, a
-    ///    failure to obtain one at all is 503 (rule 5).
-    /// 5. Refuse a route with no site/feature requirement wired at all.
-    /// 6. Refuse a non-super-admin with empty `siteAccess` before any
-    ///    feature check (rule 6).
-    /// 7. Require the specific feature on the specific site (rule 3).
+    ///    failure to obtain one at all is 503 (rule 5). Then run
+    ///    `check_access` again against the verdict, which is what makes a
+    ///    revocation bite on the next write (contract case
+    ///    `write-live-verdict-overrides-token-grant`).
     pub async fn authorize(
         &self,
         method: &Method,
@@ -239,6 +243,14 @@ impl AdminGuard {
             token: token.to_string(),
         };
 
+        let Some(require) = require else {
+            return Err(GuardError::forbidden(
+                "Admin route is missing required site/feature metadata",
+            ));
+        };
+
+        check_access(&identity, require)?;
+
         if self.config.is_mutating(method) {
             // Errors here are `Unavailable` (503) and pass straight
             // through: the IdP being unreachable is not a claim about this
@@ -259,27 +271,30 @@ impl AdminGuard {
                     )));
                 }
             }
-        }
 
-        let Some(require) = require else {
-            return Err(GuardError::forbidden(
-                "Admin route is missing required site/feature metadata",
-            ));
-        };
-
-        // Contract rule 6: refused here, before the feature check.
-        if !identity.has_any_site_access() {
-            return Err(GuardError::forbidden(
-                "No access assigned. Contact your administrator.",
-            ));
-        }
-
-        if !identity.has_feature(&require.site, &require.feature) {
-            return Err(GuardError::forbidden(
-                "Access denied. Required feature permission is missing.",
-            ));
+            check_access(&identity, require)?;
         }
 
         Ok(AuthorizedAdmin(identity))
     }
+}
+
+/// Contract rules 6 and 3, in that order. [`AdminGuard::authorize`] runs it
+/// on the signed claims and, on a mutation, again on the live verdict, so
+/// both passes refuse with the same status and message.
+fn check_access(identity: &AdminIdentity, require: &Requirement) -> GuardResult<()> {
+    // Contract rule 6: refused here, before the feature check.
+    if !identity.has_any_site_access() {
+        return Err(GuardError::forbidden(
+            "No access assigned. Contact your administrator.",
+        ));
+    }
+
+    if !identity.has_feature(&require.site, &require.feature) {
+        return Err(GuardError::forbidden(
+            "Access denied. Required feature permission is missing.",
+        ));
+    }
+
+    Ok(())
 }
