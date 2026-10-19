@@ -33,6 +33,7 @@ pub mod guard;
 pub mod introspect;
 pub mod introspect_client;
 pub mod jwks;
+pub mod step_up;
 pub mod token;
 
 pub use access::{normalize_site_access, AdminIdentity, SiteAccess, ROLE_SUPER_ADMIN};
@@ -44,4 +45,8 @@ pub use guard::{AdminGuard, AuthorizedAdmin, GuardConfig, Requirement};
 pub use introspect::{AdminIntrospection, AdminIntrospector, IntrospectionBody};
 pub use introspect_client::AdminIntrospectClient;
 pub use jwks::{AdminJwksClient, AdminJwksClientConfig, JwksKeyProvider};
+pub use step_up::{
+    require_single_use_step_up, require_step_up, StepUpConsumeClient, StepUpConsumer, StepUpError,
+    StepUpMode,
+};
 pub use token::{AdminTokenVerifier, VerifiedAdminToken};
