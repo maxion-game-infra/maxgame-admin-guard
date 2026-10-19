@@ -48,6 +48,28 @@ pub struct IntrospectionBody {
     pub site_access: Option<serde_json::Value>,
     #[serde(default)]
     pub reason: Option<String>,
+    /// Step-up session elevation (lean ROADMAP §S): unix seconds, or `null`.
+    /// A `Value`, not an `Option<i64>`, so a wrong-typed value costs only the
+    /// step-up check ([`IntrospectionBody::elevated_until`] reads it as "not
+    /// elevated") and not the whole parse — which the client turns into a
+    /// 503 on every request (`introspect_client.rs`, "response was
+    /// malformed"). Pinned by `a_wrong_typed_elevation_is_not_elevated_and_not_an_outage`.
+    #[serde(default, rename = "stepUpElevatedUntil")]
+    pub step_up_elevated_until: Option<serde_json::Value>,
+}
+
+impl IntrospectionBody {
+    /// `stepUpElevatedUntil` as unix seconds, on an `active: true` body only.
+    /// Absent, `null`, not an integer, or an inactive verdict → `None`, which
+    /// [`crate::step_up::require_step_up`] refuses.
+    pub fn elevated_until(&self) -> Option<i64> {
+        if self.active != Some(true) {
+            return None;
+        }
+        self.step_up_elevated_until
+            .as_ref()
+            .and_then(serde_json::Value::as_i64)
+    }
 }
 
 impl From<IntrospectionBody> for AdminIntrospection {
@@ -86,6 +108,20 @@ impl From<IntrospectionBody> for AdminIntrospection {
 #[async_trait]
 pub trait AdminIntrospector: Send + Sync {
     async fn introspect(&self, token: &str) -> GuardResult<AdminIntrospection>;
+
+    /// The same verdict plus the session's `stepUpElevatedUntil` (lean
+    /// ROADMAP §S), from ONE call. The default answers `None` — "not
+    /// elevated" — so an introspector that does not read the field can only
+    /// ever fail a step-up check, never pass one. [`AdminIntrospectClient`]
+    /// overrides it.
+    ///
+    /// [`AdminIntrospectClient`]: crate::introspect_client::AdminIntrospectClient
+    async fn introspect_with_step_up(
+        &self,
+        token: &str,
+    ) -> GuardResult<(AdminIntrospection, Option<i64>)> {
+        Ok((self.introspect(token).await?, None))
+    }
 }
 
 #[cfg(test)]
@@ -141,6 +177,56 @@ mod tests {
                 "{body} must read as inactive"
             );
         }
+    }
+
+    fn body(value: serde_json::Value) -> IntrospectionBody {
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn the_step_up_elevation_is_read_off_an_active_verdict_only() {
+        let active =
+            json!({ "active": true, "adminId": "admin-1", "stepUpElevatedUntil": 1_800_000_000 });
+        assert_eq!(body(active).elevated_until(), Some(1_800_000_000));
+        for absent in [
+            json!({ "active": true, "adminId": "admin-1" }),
+            json!({ "active": true, "adminId": "admin-1", "stepUpElevatedUntil": null }),
+            json!({ "active": false, "stepUpElevatedUntil": 1_800_000_000 }),
+        ] {
+            assert_eq!(body(absent.clone()).elevated_until(), None, "{absent}");
+        }
+    }
+
+    #[test]
+    fn a_wrong_typed_elevation_is_not_elevated_and_not_an_outage() {
+        for odd in [json!("1800000000"), json!(1.8e9), json!({}), json!(true)] {
+            let b =
+                body(json!({ "active": true, "adminId": "admin-1", "stepUpElevatedUntil": odd }));
+            assert_eq!(b.elevated_until(), None, "{odd}");
+            assert!(matches!(
+                AdminIntrospection::from(b),
+                AdminIntrospection::Active { .. }
+            ));
+        }
+    }
+
+    /// The default trait method never invents an elevation.
+    #[tokio::test]
+    async fn an_introspector_that_does_not_read_the_field_is_never_elevated() {
+        struct Plain;
+        #[async_trait]
+        impl AdminIntrospector for Plain {
+            async fn introspect(&self, _: &str) -> GuardResult<AdminIntrospection> {
+                Ok(AdminIntrospection::Active {
+                    admin_id: "a".into(),
+                    role: "super_admin".into(),
+                    site_access: Default::default(),
+                })
+            }
+        }
+        let (verdict, until) = Plain.introspect_with_step_up("tok").await.unwrap();
+        assert!(matches!(verdict, AdminIntrospection::Active { .. }));
+        assert_eq!(until, None);
     }
 
     #[test]

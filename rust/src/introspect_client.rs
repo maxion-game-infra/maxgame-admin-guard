@@ -97,6 +97,29 @@ impl Default for AdminIntrospectClient {
 #[async_trait]
 impl AdminIntrospector for AdminIntrospectClient {
     async fn introspect(&self, token: &str) -> GuardResult<AdminIntrospection> {
+        Ok(self.fetch(token).await?.into())
+    }
+
+    async fn introspect_with_step_up(
+        &self,
+        token: &str,
+    ) -> GuardResult<(AdminIntrospection, Option<i64>)> {
+        let body = self.fetch(token).await?;
+        let elevated_until = body.elevated_until();
+        let verdict: AdminIntrospection = body.into();
+        // `active: true` with no subject converts to Inactive: no elevation
+        // rides a verdict that cannot name its admin.
+        let elevated_until = match verdict {
+            AdminIntrospection::Active { .. } => elevated_until,
+            AdminIntrospection::Inactive { .. } => None,
+        };
+        Ok((verdict, elevated_until))
+    }
+}
+
+impl AdminIntrospectClient {
+    /// The one HTTP call both trait methods make.
+    async fn fetch(&self, token: &str) -> GuardResult<IntrospectionBody> {
         // Held for the rest of the call rather than converted to a `bool`.
         // While the breaker is half-open this permit is its one probe, and
         // every line below is downstream of an `.await` — a client that
@@ -148,7 +171,7 @@ impl AdminIntrospector for AdminIntrospectClient {
         // success here (rather than only on `active: true`) is what keeps a
         // stream of revoked tokens from tripping the breaker.
         permit.record_success();
-        Ok(body.into())
+        Ok(body)
     }
 }
 
@@ -200,6 +223,50 @@ mod tests {
             }
             other => panic!("expected active, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn introspect_with_step_up_returns_the_verdict_and_the_elevation_from_one_call() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/oauth/introspect"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "active": true,
+                "adminId": "admin-1",
+                "role": "admin",
+                "stepUpElevatedUntil": 1_800_000_000,
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (verdict, until) = client_for(&server)
+            .await
+            .introspect_with_step_up("tok")
+            .await
+            .unwrap();
+        assert!(
+            matches!(verdict, AdminIntrospection::Active { ref admin_id, .. } if admin_id == "admin-1")
+        );
+        assert_eq!(until, Some(1_800_000_000));
+    }
+
+    #[tokio::test]
+    async fn no_elevation_rides_a_verdict_that_cannot_name_its_admin() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "active": true,
+                "stepUpElevatedUntil": 1_800_000_000,
+            })))
+            .mount(&server)
+            .await;
+        let (verdict, until) = client_for(&server)
+            .await
+            .introspect_with_step_up("tok")
+            .await
+            .unwrap();
+        assert_eq!(verdict, AdminIntrospection::inactive("malformed"));
+        assert_eq!(until, None);
     }
 
     #[tokio::test]
