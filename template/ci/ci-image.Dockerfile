@@ -13,7 +13,23 @@
 # Bump the tag in lockstep with the rust version in every repo's Dockerfile
 # (currently 1.97) and update deploy-dev.yml's `container.image` to match.
 FROM rust:1.97-slim-bookworm
+# `docker-ce-cli` + `docker-compose-plugin` (compose v2) and `python3`: the CLI
+# only, for checks that ask `docker compose config` what compose would run
+# (maxgame-plaza `scripts/check-compose-env.sh`). `config` needs no daemon and
+# no socket. From docker's own apt repo, as maxgame-web3's
+# `tools/ci-image/Dockerfile` does: bookworm's `docker-compose` package is v1.
+# Baked in here, never apt-installed per run: the runners' network is the
+# flaky part (lean W471).
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends pkg-config git ca-certificates curl \
+    && apt-get install -y --no-install-recommends pkg-config git ca-certificates curl gnupg python3 \
+    && install -m 0755 -d /etc/apt/keyrings \
+    && curl -fsSL https://download.docker.com/linux/debian/gpg \
+        | gpg --dearmor -o /etc/apt/keyrings/docker.gpg \
+    && echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian bookworm stable" \
+        > /etc/apt/sources.list.d/docker.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends docker-ce-cli docker-compose-plugin \
     && rm -rf /var/lib/apt/lists/* \
-    && rustup component add rustfmt clippy
+    && rustup component add rustfmt clippy \
+    && docker compose version \
+    && python3 --version
