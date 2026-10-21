@@ -33,3 +33,17 @@ RUN apt-get update \
     && rustup component add rustfmt clippy \
     && docker compose version \
     && python3 --version
+# The toolchains the repos on this image PIN in `rust-toolchain.toml`, baked
+# in so a job never syncs one at run time (lean W503: every plaza run
+# downloaded 1.95). Surveyed 2026-10-21 over each repo's default branch:
+# `1.95` (maxgame-payment-gateway, -plaza, -plaza-e2e, -signer) and `1.95.0`
+# (maxgame-wallet, -web3). Those are two rustup toolchains, not one, because
+# `1.95` tracks the latest 1.95.x. Each pin asks for rustfmt and clippy. A repo
+# with no pin runs this image's default (1.97). When a repo's pin moves, add it
+# here and rebuild.
+RUN rustup toolchain install 1.95 1.95.0 --profile minimal -c rustfmt -c clippy \
+    && rustup run 1.95 cargo --version \
+    && rustup run 1.95 cargo clippy --version \
+    && rustup run 1.95.0 cargo --version \
+    && rustup run 1.95.0 cargo clippy --version \
+    && cargo --version | grep -q '^cargo 1\.97\.'
