@@ -329,7 +329,8 @@ checked with the service's own URL and client but no credential; only the
 service's own datastores can turn the answer into 503 (`unavailable`); an
 upstream hop that fails turns a 200 into `degraded`, never a 503; and
 `draining` is the 503 answered after SIGTERM, with no `dependency`. The
-`maxgame-readiness` crate in that repo implements it, and a consumer MUST
+`maxgame-readiness` crate in this repository's `readiness/` implements it,
+and a consumer MUST
 read the body, not only the status code. Services adopt it one at a time;
 until a service has, its body stays the older shape below and the
 aggregator shows its hops as "not reported".
