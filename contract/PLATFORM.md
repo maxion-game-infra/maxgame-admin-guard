@@ -316,9 +316,23 @@ separating it from `/readyz` (the "Rule" above): a liveness probe that pings
 a database turns that database's blip into every pod's restart.
 
 ```json
-GET /readyz → 200 {"status": "ready"}
-GET /readyz → 503 {"status": "unavailable", "dependency": "<name>"}
+GET /readyz → 200 {"status": "ready" | "degraded", "service": "<key>", "env": "<tier>", "checks": {...}}
+GET /readyz → 503 {"status": "unavailable", "dependency": "<name>", "service": "<key>", "env": "<tier>", "checks": {...}}
+GET /readyz → 503 {"status": "draining"}
 ```
+
+**Per-hop checks (2026-10-26).** The body above is specified in full by the
+readiness contract in `maxgame-readiness-contract/CONTRACT.md` (repo
+`maxion-game-infra/maxgame-readiness-contract`), which this section now
+defers to. In short: `checks` reports every hop the service depends on, each
+checked with the service's own URL and client but no credential; only the
+service's own datastores can turn the answer into 503 (`unavailable`); an
+upstream hop that fails turns a 200 into `degraded`, never a 503; and
+`draining` is the 503 answered after SIGTERM, with no `dependency`. The
+`maxgame-readiness` crate in that repo implements it, and a consumer MUST
+read the body, not only the status code. Services adopt it one at a time;
+until a service has, its body stays the older shape below and the
+aggregator shows its hops as "not reported".
 
 A service **may add fields to either response** (additive only) but **must
 not rename or drop `status`**, and on the 503 branch must not drop
@@ -353,6 +367,13 @@ rather than converged away:
   unrelated in shape to `/healthz`/`/readyz` — additive, kept because
   existing runbooks and uptime checks call that path. Source:
   `maxgame-mail-server/src/inbound/health.rs`.
+
+When `utility` and `authServer` adopt the readiness contract, their extra
+fields move into `checks`: utility's `database`, `bucketRegistry` and
+`r2Credentials` become checks (utility keeps its sanctioned gating on the
+registry and the R2 credential, CONTRACT.md §2), and authServer's three
+booleans stay as **deprecated aliases** next to `checks` until the
+production parser that reads them moves to `checks`.
 
 `api` (NestJS) carries a fourth, platform-wide alias rather than a
 service-specific addition: its pre-existing `/health` → `{"ok": true}` stays
@@ -556,6 +577,10 @@ impl AppEnv {
     pub fn is_production(&self) -> bool { matches!(self, AppEnv::Production) }
 }
 ```
+
+The `env` field that `/readyz` and `/v1/ping` report (readiness contract
+§3.2, §5) is this parsed tier, spelled `development`, `staging` or
+`production`, never the raw `APP_ENV` value.
 
 Source: `maxgame-utility-server/src/config.rs:40-94` — this is the reference
 implementation. The load-bearing rule, stated in that file's own doc comment:
@@ -913,6 +938,12 @@ nests its whole router under it (axum `Router::nest(base_path, app)`).
   in the document should match what a client actually calls).
 - Per-repo M2 test: boot with `BASE_PATH=/x`, assert every existing route
   answers under `/x/...` and `/healthz`+`/readyz` still answer at the root.
+- **`GET {BASE_PATH}/v1/ping` is the one probe route mounted *under* the
+  prefix** (readiness contract §5): it answers
+  `{"service": "<key>", "env": "<tier>"}`, unauthenticated, so a caller can
+  check that its configured base URL, prefix included, points at the right
+  service in the right env. M2 assertion: `/x/v1/ping` answers, `/v1/ping`
+  does not.
 
 ### 5.3 Why prefix-in-service, not rewrite-at-ingress
 
@@ -1440,7 +1471,8 @@ section rather than assuming every bullet below applies unmodified.
 - [ ] `GET /healthz` and `GET /readyz` both exist at the root and return 2xx
       when the service is healthy, independent of `BASE_PATH`.
 - [ ] `GET /healthz` answers exactly `{"status": "ok"}` and never queries a
-      dependency; `GET /readyz` answers `{"status": "ready"}` on 200 and
+      dependency; `GET /readyz` answers `"ready"` **or `"degraded"`** on 200
+      (a test env with no upstreams is `degraded`, not a failure) and
       `{"status": "unavailable", "dependency": "<name>"}` on 503, with any
       repo-specific extra fields present but `status`/`dependency` neither
       renamed nor dropped (§3.1's body shape) — e.g. `utility`'s `buckets`
