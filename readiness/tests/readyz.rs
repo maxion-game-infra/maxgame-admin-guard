@@ -518,3 +518,47 @@ async fn router_serves_the_body_with_no_store() {
     assert_eq!(body["checks"]["key_server"]["status"], "unexpected");
     assert_schema(&body);
 }
+
+// A service whose `/readyz` is reachable from the internet (an ingress that
+// routes `path: /` to it) can drop `target` from every check, so the body
+// names no internal host. Everything else in the check stays.
+#[tokio::test]
+async fn omit_targets_drops_target_from_every_check_and_keeps_the_rest() {
+    let target = "http://admin-auth.platform.svc:8090/.well-known/jwks.json";
+    let build = |omit: bool| {
+        let builder = Readiness::builder("csServer", AppEnv::Development)
+            .gate(
+                "postgres",
+                FnProbe::new(|| async { ProbeOutcome::ok() }).target(target),
+            )
+            .report(
+                "admin_jwks",
+                FnProbe::new(|| async { ProbeOutcome::fail(CheckStatus::Unreachable, "timeout") })
+                    .target(target),
+            );
+        if omit {
+            builder.omit_targets().build()
+        } else {
+            builder.build()
+        }
+    };
+
+    let shown = build(false);
+    shown.run_reporting_once().await;
+    let (_, body) = shown.body().await;
+    assert_eq!(body["checks"]["admin_jwks"]["target"], target, "{body}");
+
+    let hidden = build(true);
+    hidden.run_reporting_once().await;
+    let (code, body) = hidden.body().await;
+    assert_eq!(code, StatusCode::OK);
+    assert!(!body.to_string().contains("platform.svc"), "{body}");
+    for name in ["postgres", "admin_jwks"] {
+        assert!(body["checks"][name].get("target").is_none(), "{body}");
+    }
+    let jwks = &body["checks"]["admin_jwks"];
+    assert_eq!(jwks["status"], "unreachable", "{body}");
+    assert_eq!(jwks["reason"], "timeout", "{body}");
+    assert_eq!(body["status"], "degraded", "{body}");
+    assert_schema(&body);
+}

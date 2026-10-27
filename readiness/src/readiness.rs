@@ -116,6 +116,8 @@ struct Inner {
     /// `pending` → `stale` deadline (`CONTRACT.md` §6.1).
     started_at: Mutex<Instant>,
     draining: AtomicBool,
+    /// Drop `target` from every check (see [`ReadinessBuilder::omit_targets`]).
+    omit_targets: bool,
 }
 
 impl Inner {
@@ -177,6 +179,7 @@ pub struct ReadinessBuilder {
     probe_timeout: Duration,
     trigger_cooldown: Duration,
     hops: Vec<HopSpec>,
+    omit_targets: bool,
 }
 
 struct HopSpec {
@@ -198,6 +201,7 @@ impl Readiness {
             probe_timeout: DEFAULT_PROBE_TIMEOUT,
             trigger_cooldown: DEFAULT_TRIGGER_COOLDOWN,
             hops: Vec::new(),
+            omit_targets: false,
         }
     }
 
@@ -441,7 +445,7 @@ impl Readiness {
         let mut statuses = vec![CheckStatus::Ok; inner.hops.len()];
 
         for (i, hop) in inner.hops.iter().enumerate() {
-            let check = if let Some((outcome, latency)) = gate_outcomes[i].as_ref() {
+            let mut check = if let Some((outcome, latency)) = gate_outcomes[i].as_ref() {
                 CheckBody::from_outcome(outcome, hop, Some(as_ms(*latency)), None)
             } else if let Some(idx) = hop.reporting_index {
                 reporting_check(inner, hop, &reporting[idx], now, started_at)
@@ -449,6 +453,9 @@ impl Readiness {
                 // An optional hop that is switched off (CONTRACT.md §3.5).
                 CheckBody::not_configured(hop)
             };
+            if inner.omit_targets {
+                check.target = None;
+            }
             statuses[i] = check.status;
             checks.insert(
                 hop.name.clone(),
@@ -919,6 +926,19 @@ impl ReadinessBuilder {
         self
     }
 
+    /// Leave `target` out of every check in the body.
+    ///
+    /// `target` names the host, port and path of each hop (`CONTRACT.md`
+    /// §3.6, §9), which is internal topology. The contract assumes `/readyz`
+    /// is only reachable inside the cluster. A service whose ingress routes
+    /// `path: /` to it serves `/readyz` to the internet, and should call
+    /// this until the ingress stops routing `/readyz`. Status, reason,
+    /// latency and HTTP status stay; only the hop's address goes.
+    pub fn omit_targets(mut self) -> Self {
+        self.omit_targets = true;
+        self
+    }
+
     /// The build version or image tag, reported as `version`
     /// (`CONTRACT.md` §3.2).
     pub fn version(mut self, version: impl Into<String>) -> Self {
@@ -1118,6 +1138,7 @@ impl ReadinessBuilder {
             notify: Notify::new(),
             started_at: Mutex::new(Instant::now()),
             draining: AtomicBool::new(false),
+            omit_targets: self.omit_targets,
         }))
     }
 }
