@@ -118,6 +118,28 @@ struct Inner {
     draining: AtomicBool,
     /// Drop `target` from every check (see [`ReadinessBuilder::omit_targets`]).
     omit_targets: bool,
+    /// See [`ReadinessBuilder::on_demand`]: the idle window, or `None` to
+    /// probe on the schedule whether anyone asks or not.
+    on_demand: Option<Duration>,
+    /// When a caller carrying [`PROBE_HEADER`] last asked for the body.
+    last_demand: Mutex<Option<Instant>>,
+    /// When the on-demand runner last woke from idle. A result produced
+    /// before this reads `pending` until the hop is re-checked.
+    woke_at: Mutex<Option<Instant>>,
+}
+
+impl Inner {
+    /// Whether an on-demand runner has nobody asking and should sleep.
+    fn is_idle(&self, now: Instant) -> bool {
+        match self.on_demand {
+            None => false,
+            Some(idle) => self
+                .last_demand
+                .lock()
+                .unwrap()
+                .is_none_or(|at| now.saturating_duration_since(at) > idle),
+        }
+    }
 }
 
 impl Inner {
@@ -180,6 +202,7 @@ pub struct ReadinessBuilder {
     trigger_cooldown: Duration,
     hops: Vec<HopSpec>,
     omit_targets: bool,
+    on_demand: Option<Duration>,
 }
 
 struct HopSpec {
@@ -202,6 +225,7 @@ impl Readiness {
             trigger_cooldown: DEFAULT_TRIGGER_COOLDOWN,
             hops: Vec::new(),
             omit_targets: false,
+            on_demand: None,
         }
     }
 
@@ -216,6 +240,14 @@ impl Readiness {
         let inner = Arc::clone(&self.0);
         tokio::spawn(async move {
             loop {
+                // On-demand: sleep until someone asks (CONTRACT.md §6.1 is
+                // the schedule while they do).
+                while inner.is_idle(Instant::now()) {
+                    if inner.draining.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    inner.notify.notified().await;
+                }
                 let wait = cycle(&inner).await;
                 if inner.draining.load(Ordering::Relaxed) {
                     break;
@@ -241,6 +273,33 @@ impl Readiness {
     /// supported.
     pub async fn run_reporting_once(&self) {
         cycle(&self.0).await;
+    }
+
+    /// [`Readiness::body`] for a request with these headers. A caller that
+    /// carries [`PROBE_HEADER`] counts as someone looking, which wakes an
+    /// on-demand runner (see [`ReadinessBuilder::on_demand`]). Without
+    /// on-demand this is exactly [`Readiness::body`].
+    pub async fn body_for(&self, headers: &HeaderMap) -> (StatusCode, Value) {
+        if is_probe_request(headers) {
+            self.note_demand();
+        }
+        self.body().await
+    }
+
+    /// Record that someone is looking. Wakes an idle on-demand runner.
+    pub fn note_demand(&self) {
+        let inner = &self.0;
+        if inner.on_demand.is_none() {
+            return;
+        }
+        let now = Instant::now();
+        let was_idle = inner.is_idle(now);
+        *inner.last_demand.lock().unwrap() = Some(now);
+        if was_idle {
+            *inner.woke_at.lock().unwrap() = Some(now);
+            *inner.started_at.lock().unwrap() = now;
+            inner.notify.notify_one();
+        }
     }
 
     /// Mark the process as draining (SIGTERM). From here on `/readyz`
@@ -632,6 +691,18 @@ fn reporting_check(
             if cached_status(cached, effective, now) == CheckStatus::Stale {
                 check.status = CheckStatus::Stale;
             }
+            // An on-demand runner that just woke has not re-checked this hop
+            // yet: its old result says nothing about now, and calling it
+            // stale would degrade the service for having been idle.
+            let woke = *inner.woke_at.lock().unwrap();
+            if let Some(woke) = woke {
+                if cached.produced_at < woke && now.saturating_duration_since(woke) < effective * 2
+                {
+                    check.status = CheckStatus::Pending;
+                    check.reason = None;
+                    check.http_status = None;
+                }
+            }
             check
         }
     }
@@ -926,6 +997,43 @@ impl ReadinessBuilder {
         self
     }
 
+    /// Probe reporting hops only while someone is looking.
+    ///
+    /// The background runner stays idle until a request carrying
+    /// [`PROBE_HEADER`] (the readiness aggregator) reaches
+    /// [`Readiness::body_for`]. It then runs every due hop straight away,
+    /// keeps the normal schedule while such requests keep coming, and goes
+    /// idle again once none has arrived for `idle`. A kubelet probe sends no
+    /// such header and never wakes it. Gating checks are unaffected: they run
+    /// inline on every request, as always.
+    ///
+    /// The trade: a hop that breaks while nobody is looking is not seen until
+    /// someone looks. Use it where something else watches the fleet.
+    /// [`Readiness::hop_failed`] still marks a hop due, and the runner picks
+    /// it up on the next wake.
+    pub fn on_demand(mut self, idle: Duration) -> Self {
+        self.on_demand = Some(idle);
+        self
+    }
+
+    /// [`ReadinessBuilder::on_demand`] from `READYZ_ON_DEMAND_IDLE_SECONDS`.
+    /// Unset, empty or `0` keeps the always-on runner; a value that does not
+    /// parse warns and keeps it too.
+    pub fn on_demand_from_env(self) -> Self {
+        match std::env::var(ON_DEMAND_ENV_VAR) {
+            Ok(raw) if raw.trim().is_empty() => self,
+            Ok(raw) => match raw.trim().parse::<u64>() {
+                Ok(0) => self,
+                Ok(secs) => self.on_demand(Duration::from_secs(secs)),
+                Err(err) => {
+                    tracing::warn!(var = ON_DEMAND_ENV_VAR, error = %err, "ignoring unreadable on-demand idle window");
+                    self
+                }
+            },
+            Err(_) => self,
+        }
+    }
+
     /// Leave `target` out of every check in the body.
     ///
     /// `target` names the host, port and path of each hop (`CONTRACT.md`
@@ -1139,6 +1247,9 @@ impl ReadinessBuilder {
             started_at: Mutex::new(Instant::now()),
             draining: AtomicBool::new(false),
             omit_targets: self.omit_targets,
+            on_demand: self.on_demand,
+            last_demand: Mutex::new(None),
+            woke_at: Mutex::new(None),
         }))
     }
 }
@@ -1161,6 +1272,9 @@ fn validate_hop_name(name: &str) -> Result<(), &'static str> {
 /// `CONTRACT.md` §6.3 rule 1: every probe request carries this header, so
 /// the upstream can keep it out of traffic metrics and per-key budgets.
 pub const PROBE_HEADER: &str = "x-readiness-probe";
+
+/// The env var [`ReadinessBuilder::on_demand_from_env`] reads.
+pub const ON_DEMAND_ENV_VAR: &str = "READYZ_ON_DEMAND_IDLE_SECONDS";
 
 /// Whether the request carries [`PROBE_HEADER`] with a caller service key.
 pub fn is_probe_request(headers: &HeaderMap) -> bool {

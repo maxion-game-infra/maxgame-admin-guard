@@ -99,8 +99,8 @@ pub use probe::{sanitize_target, FnProbe, Probe};
 pub use readiness::{
     is_probe_request, should_trigger, Readiness, ReadinessBuilder, DEFAULT_INTERVAL_SECONDS,
     DEFAULT_TRIGGER_COOLDOWN_SECONDS, INTERVAL_ENV_VAR, MAX_INTERVAL_SECONDS,
-    MAX_TRIGGER_COOLDOWN_SECONDS, MIN_INTERVAL_SECONDS, MIN_TRIGGER_COOLDOWN_SECONDS, PROBE_HEADER,
-    TRIGGER_COOLDOWN_ENV_VAR,
+    MAX_TRIGGER_COOLDOWN_SECONDS, MIN_INTERVAL_SECONDS, MIN_TRIGGER_COOLDOWN_SECONDS,
+    ON_DEMAND_ENV_VAR, PROBE_HEADER, TRIGGER_COOLDOWN_ENV_VAR,
 };
 #[cfg(feature = "redis")]
 pub use redis_probe::{classify_redis_error, RedisProbe};
