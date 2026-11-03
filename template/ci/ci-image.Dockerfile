@@ -7,11 +7,16 @@
 # pulls, pull credentials, and quota; the trade-off is that a fresh runner
 # machine must rebuild it before workflows pass. Rebuild + push:
 #
-#   docker build -t localhost:5000/maxgame-ci-rust:1.97 -f ci-image.Dockerfile .
-#   docker push localhost:5000/maxgame-ci-rust:1.97
+#   docker build -t localhost:5000/maxgame-ci-rust:1.97-r4 -f ci-image.Dockerfile .
+#   docker push localhost:5000/maxgame-ci-rust:1.97-r4
 #
 # Bump the tag in lockstep with the rust version in every repo's Dockerfile
 # (currently 1.97) and update deploy-dev.yml's `container.image` to match.
+# A change to this file gets a NEW revision tag (`1.97-rN`); never rebuild a tag
+# a workflow already uses, or every repo on it changes under its next run.
+# Revisions on both office runners (108, 111): `1.97` = 2026-08-15 original
+# (most fleet repos), `-r2` + docker CLI/compose + python3, `-r3` + the 1.95
+# toolchains (the plaza repos), `-r4` + cargo-nextest.
 FROM rust:1.97-slim-bookworm
 # `docker-ce-cli` + `docker-compose-plugin` (compose v2) and `python3`: the CLI
 # only, for checks that ask `docker compose config` what compose would run
@@ -47,3 +52,16 @@ RUN rustup toolchain install 1.95 1.95.0 --profile minimal -c rustfmt -c clippy 
     && rustup run 1.95.0 cargo --version \
     && rustup run 1.95.0 cargo clippy --version \
     && cargo --version | grep -q '^cargo 1\.97\.'
+# cargo-nextest, pinned: a repo's `scripts/ci.sh` runs its suite under it. Baked
+# in so the first run on each runner does not compile it (~9 min there). Keep
+# the version in lockstep with NEXTEST_VERSION in those scripts, which fall back
+# to installing their own copy when the two differ. The registry is dropped:
+# CI mounts the runner's own over /usr/local/cargo/registry.
+# `.global-cache` goes too, and auto-clean is off: that database records when
+# each crate was last used, but CI mounts only the registry, so every container
+# would start from build-time timestamps and cargo (>= 1.88) would garbage-
+# collect the registry every repo shares on the runner.
+ENV CARGO_CACHE_AUTO_CLEAN_FREQUENCY=never
+RUN cargo install --locked --version 0.9.150 cargo-nextest \
+    && rm -rf /usr/local/cargo/registry /usr/local/cargo/.global-cache \
+    && cargo nextest --version | grep -qF ' 0.9.150'
