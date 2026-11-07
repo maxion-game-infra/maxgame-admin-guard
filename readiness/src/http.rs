@@ -250,6 +250,8 @@ async fn read_body_bounded(mut response: reqwest::Response) -> Result<BodyRead, 
 /// transport failure becomes the outcome it deserves (`CONTRACT.md` §3.5),
 /// and a received response is handed to the caller, which knows which
 /// statuses it accepts and whether the body matters.
+// A failed probe is the outcome itself, and probes run far apart, so boxing buys nothing.
+#[allow(clippy::result_large_err)]
 async fn send_probe(request: reqwest::RequestBuilder) -> Result<reqwest::Response, ProbeOutcome> {
     match request.send().await {
         Ok(response) => Ok(response),
