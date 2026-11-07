@@ -1,0 +1,189 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/maxion-game-infra/maxgame-readiness-contract/schema/readyz.schema.json",
+  "title": "GET /readyz response body",
+  "description": "See CONTRACT.md \u00a73. Additive fields are allowed at every level.",
+  "type": "object",
+  "required": [
+    "status"
+  ],
+  "properties": {
+    "status": {
+      "enum": [
+        "ready",
+        "degraded",
+        "unavailable",
+        "draining"
+      ]
+    },
+    "dependency": {
+      "type": "string",
+      "minLength": 1
+    },
+    "service": {
+      "type": "string",
+      "minLength": 1
+    },
+    "env": {
+      "enum": [
+        "development",
+        "staging",
+        "production"
+      ]
+    },
+    "version": {
+      "type": "string"
+    },
+    "checks": {
+      "type": "object",
+      "propertyNames": {
+        "pattern": "^[a-z][a-z0-9_]*$"
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/check"
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "unavailable"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "dependency"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "enum": [
+              "ready",
+              "degraded",
+              "unavailable"
+            ]
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "service",
+          "env",
+          "checks"
+        ]
+      }
+    }
+  ],
+  "$defs": {
+    "check": {
+      "type": "object",
+      "required": [
+        "status",
+        "gate",
+        "required"
+      ],
+      "properties": {
+        "status": {
+          "enum": [
+            "ok",
+            "pending",
+            "stale",
+            "not_configured",
+            "misconfigured",
+            "unreachable",
+            "wrong_target",
+            "unexpected"
+          ]
+        },
+        "gate": {
+          "type": "boolean"
+        },
+        "required": {
+          "type": "boolean"
+        },
+        "latencyMs": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "checkedAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "httpStatus": {
+          "type": "integer",
+          "minimum": 100,
+          "maximum": 599
+        },
+        "reason": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]*$"
+        },
+        "target": {
+          "type": "string",
+          "description": "scheme://host[:port][/path] only: no userinfo, query or fragment",
+          "pattern": "^[a-z][a-z0-9+.-]*://[^/@?#]+(/[^?#]*)?$"
+        },
+        "expected": {
+          "$ref": "#/$defs/identity"
+        },
+        "observed": {
+          "$ref": "#/$defs/identity"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "not_configured"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "required": {
+                "const": false
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "enum": [
+                  "misconfigured",
+                  "unreachable",
+                  "wrong_target",
+                  "unexpected"
+                ]
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "reason"
+            ]
+          }
+        }
+      ]
+    },
+    "identity": {
+      "type": "object",
+      "properties": {
+        "service": {
+          "type": "string"
+        },
+        "env": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}

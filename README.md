@@ -9,6 +9,8 @@ rust/       axum middleware + extractor. The crate is named
             `maxion-admin-guard` (only the repository was renamed).
 js/         NestJS guard + framework-free middleware.
 template/   a scaffold for a new Rust service that starts out conformant.
+readiness/  the `maxgame-readiness` crate: per-hop `/readyz` checks and the
+            `/v1/ping` identity route (readiness contract).
 ```
 
 Both implementations run `contract/cases.json` as their test suite. They live in
@@ -35,6 +37,12 @@ conformance test), `maxgame-auth-server`, `maxgame-key-server`,
 the NestJS admin surface those guards protected has been retired, so the JS
 implementation exists to keep the contract honest in a second language rather
 than to serve live traffic.
+
+`readiness/` is the shared implementation of the readiness contract
+(`maxion-game-infra/maxgame-readiness-contract`). It lives here rather than
+in that repository so consuming CI can check it out without credentials,
+the same reason this repository is public. `maxgame-launcher-backend` is the
+first service to adopt it.
 
 ## Consuming it
 

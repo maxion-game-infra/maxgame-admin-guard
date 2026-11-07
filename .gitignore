@@ -3,3 +3,4 @@
 /js/dist
 .omc/
 .DS_Store
+/readiness/target
