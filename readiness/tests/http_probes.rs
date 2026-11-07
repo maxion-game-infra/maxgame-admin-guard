@@ -627,7 +627,8 @@ async fn jwks_probe_classifies_key_sets() {
 // AuthEndpointProbe
 // ----------------------------------------------------------------------
 
-// 14. The endpoint's own 401/403 is ok (the address is right); a 404 is
+// 14. The endpoint's own 400/401/403 is ok (the address is right: an internal
+//     route with no auth layer refuses the empty body with 400); a 404 is
 //     not_found; a 2xx is unexpected_status, because an auth-protected
 //     route answering an unauthenticated request means the URL points
 //     somewhere else; a 5xx is upstream_5xx. On the wire: POST, an empty
@@ -641,6 +642,12 @@ async fn auth_endpoint_probe_posts_empty_json_and_classifies_auth_answers() {
             "application/json",
             "{}".to_owned(),
         )
+        .merge(answering(
+            "/verify/400",
+            StatusCode::BAD_REQUEST,
+            "application/json",
+            "{}".to_owned(),
+        ))
         .merge(answering(
             "/verify/403",
             StatusCode::FORBIDDEN,
@@ -675,6 +682,11 @@ async fn auth_endpoint_probe_posts_empty_json_and_classifies_auth_answers() {
     assert_eq!(unauthorized.reason, None);
     assert_eq!(unauthorized.http_status, Some(401));
 
+    let refused = probe(format!("{base}/verify/400")).run().await;
+    assert_eq!(refused.status, CheckStatus::Ok, "{refused:?}");
+    assert_eq!(refused.reason, None);
+    assert_eq!(refused.http_status, Some(400));
+
     let forbidden = probe(format!("{base}/verify/403")).run().await;
     assert_eq!(forbidden.status, CheckStatus::Ok, "{forbidden:?}");
     assert_eq!(forbidden.http_status, Some(403));
@@ -697,7 +709,7 @@ async fn auth_endpoint_probe_posts_empty_json_and_classifies_auth_answers() {
     assert_eq!(broken.http_status, Some(500));
 
     let requests = take(&seen);
-    assert_eq!(requests.len(), 5, "one probe request per case");
+    assert_eq!(requests.len(), 6, "one probe request per case");
     for request in &requests {
         assert_eq!(request.method, "POST", "{request:?}");
         assert_eq!(
@@ -709,7 +721,7 @@ async fn auth_endpoint_probe_posts_empty_json_and_classifies_auth_answers() {
         assert_eq!(
             request.header("authorization"),
             None,
-            "no credential, or the 401/403 would prove nothing: {request:?}"
+            "no credential, or the answer would prove nothing: {request:?}"
         );
         assert_eq!(request.header("x-api-key"), None, "{request:?}");
         assert_eq!(

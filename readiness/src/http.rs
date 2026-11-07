@@ -520,7 +520,9 @@ impl Probe for JwksProbe {
 /// A 401 or 403 from the endpoint's own auth layer is `ok`: an
 /// unauthenticated request that comes back as the endpoint's own rejection
 /// proves the route exists at that path on a service that enforces auth —
-/// the address is right (`CONTRACT.md` §6.2). A 404 is `unexpected`
+/// the address is right (`CONTRACT.md` §6.2). A 400 is `ok` for the same
+/// reason: internal routes such as the IdP's `/v1/internal/introspect` have
+/// no auth layer, so they refuse the empty body instead. A 404 is `unexpected`
 /// (`not_found`): the path or prefix is wrong. A 2xx is `unexpected`
 /// (`unexpected_status`), because an auth-protected route answering an
 /// unauthenticated request means the URL points somewhere else.
@@ -570,9 +572,9 @@ impl Probe for AuthEndpointProbe {
             };
             let status = response.status().as_u16();
             match status {
-                // The endpoint's own auth layer answered: the address is
-                // right (CONTRACT.md §6.2).
-                401 | 403 => ProbeOutcome::ok().with_http_status(status),
+                // The route itself refused the empty body, or its auth layer
+                // did: the address is right (CONTRACT.md §6.2).
+                400 | 401 | 403 => ProbeOutcome::ok().with_http_status(status),
                 _ => classify_error_status(status),
             }
         })

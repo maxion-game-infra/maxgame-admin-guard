@@ -21,7 +21,7 @@ use crate::probe::{sanitize_target, Probe};
 
 /// Default background interval, `READYZ_CHECK_INTERVAL_SECONDS`
 /// (`CONTRACT.md` §6.1).
-pub const DEFAULT_INTERVAL_SECONDS: u64 = 30;
+pub const DEFAULT_INTERVAL_SECONDS: u64 = 300;
 /// Smallest interval the knob allows (`CONTRACT.md` §6.1).
 pub const MIN_INTERVAL_SECONDS: u64 = 10;
 /// Largest interval the knob allows (`CONTRACT.md` §6.1).
@@ -1055,7 +1055,7 @@ impl ReadinessBuilder {
     }
 
     /// The background interval for reporting checks. Clamped to the allowed
-    /// range of 10–300 s (`CONTRACT.md` §6.1). Defaults to 30 s.
+    /// range of 10–300 s (`CONTRACT.md` §6.1). Defaults to 300 s.
     pub fn interval(mut self, interval: Duration) -> Self {
         self.interval = interval.clamp(MIN_INTERVAL, MAX_INTERVAL);
         self
