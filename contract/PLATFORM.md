@@ -1285,6 +1285,11 @@ accounts:player-read      launcher:games-read
 > เปลี่ยนชื่อเป็น `utility:file-upload` (utility `FILE_UPLOAD_SCOPE` + UI ใหม่) —
 > คีย์ที่ถือชื่อเก่า verify ยังผ่านจนกว่า service ปลายทางจะ require ชื่อใหม่
 
+> 2026-11-08: `knowledge:query` and `knowledge:ingest` added for
+> `maxgame-knowledge-server` (§6.5 row `knowledge`). Both are narrowed by
+> `metadata.collections`. `knowledge:query` is also the only scope the
+> delegated `/v1/admin/knowledge-keys` door can issue (below).
+
 Every scope is prefixed with the service that actually enforces it
 (`<service>:<action>`) — there is no shared `platform:` owner (that prefix
 was a NestJS-era holdover and no longer appears anywhere in the catalog).
@@ -1320,6 +1325,28 @@ before it was deleted, with nothing at the time stopping a similar name
 from coming back. The test now also asserts the action half contains no
 further `:`, so the two-part `<service>:<action>` convention is enforced,
 not merely observed.
+
+**Delegated issuance (2026-11-08).** Issuing a key is `super_admin`-only on
+`/v1/admin/keys`, with one narrower door beside it, for admins holding
+feature `issue-key` on site `knowledge` (admin-auth data, granted per
+admin). key-server's `require_knowledge_issuer` checks it on the signed
+`siteAccess`, and on a write again on the live introspection verdict, the
+same order as the super_admin gate:
+
+| Method · path (under `/keys`) | Behaviour |
+|---|---|
+| `POST /v1/admin/knowledge-keys` | Body `{collections, name?, expires_in_days?}`. `collections`: 1 to 10 slugs, each `^[a-z0-9-]{1,64}$`, duplicates collapsed. `expires_in_days`: 1 to 30, default 7. Anything outside that, or any other field (`scopes`, `consumer`, `metadata`), is 422. key-server fixes `scopes = ["knowledge:query"]`, `consumer = "knowledge-delegated:<admin id>"` (the IdP admin id, never an email) and `metadata = {"collections": [...]}`. 201 returns the plaintext once, same shape as `POST /v1/admin/keys`. At most 10 issues per admin per rolling hour, counted from `service_key` itself, so the window survives restarts and is shared by replicas. Over the limit is 429 with `Retry-After` (§3.6 rule 1). |
+| `GET /v1/admin/knowledge-keys?page=&take=` | Only keys whose `consumer` is the caller's own `knowledge-delegated:<admin id>`. No `consumer` filter is accepted (400). Same `{items, meta}` envelope as §2.1. |
+| `POST /v1/admin/knowledge-keys/{id}/revoke` | Only the caller's own keys. Any other id is 404, byte-identical to an unknown id. A second revoke is 409. |
+
+Both the `issue` and `revoke` rows in `key_audit` carry `detail.delegated =
+true`, with `actor` = the admin id. A leaked admin token with the feature can
+therefore mint only short-lived query keys over collections it names, in its
+own name. Everything else, including the importer's `knowledge:ingest` key,
+stays on `/v1/admin/keys`. Source: `maxgame-key-server/src/routes/knowledge_keys.rs`,
+`src/services/admin_keys.rs` (`issue_delegated`, `revoke_as`),
+`src/infrastructure/admin_auth.rs` (`require_knowledge_issuer`); tests in
+`tests/knowledge_keys_test.rs`.
 
 ### 6.4 Legacy S2S secrets registry (not migrated by this plan)
 
@@ -1359,6 +1386,7 @@ qualifies.
 | `authServer` (`maxgame-auth-server`) | `GET /v1/external/players/{player_id}/accounts` | `accounts:player-accounts-read` | `metadata.tenants` (`VerifiedServiceKey::granted_tenants`), **explicit only** — the same fail-closed shape as `mailer`'s `allowed_senders` and `utility`'s `buckets` above: **absent `metadata`, absent `tenants`, an empty array, or a non-array all mean no tenant, never every tenant.** A non-string entry sitting beside good ones in the array is dropped rather than voiding the rest; each string entry is trimmed, so a whitespace-only entry (e.g. `" "`) is dropped the same way an empty string is, and `" mu-maxage "` grants exactly `mu-maxage`. Tenant matching is **exact** — byte equality, no case folding of any kind. It has to be, and the reason is the rule stated in §6.0 above: `game.tenant` is an unnormalized `TEXT PRIMARY KEY` looked up with `=`, so two tenants differing only in case are two different games, and a comparison looser than the identity would authorize a key granted one to read the other. **This row briefly said the opposite.** Between 2026-08-27's first and second passes the comparison was `eq_ignore_ascii_case`, copied from `utility`'s `may_use_bucket` — safe *there*, because bucket names are lowercased at registration, and a privilege widening *here*, because tenants are not. A mistyped tenant therefore now grants **nothing** rather than something wider; typo-tolerance belongs at issue time, where the back office validates the value against the live tenant list and the operator gets an error instead of a broader key. A key naming **no** usable tenant answers **403**, once, at the gate, rather than 200-with-nothing — a statement about the caller's own misconfiguration, not about any player, so it costs nothing to say plainly and saves the key's owner a debugging session. A key that does name a usable tenant sees only the accounts held in it; a player who holds none of them answers **404**, byte-identical to a `player_id` that does not exist at all — see §6.0's 404-collapse rule, which this row inherits rather than restates. `mxs_`-only. Added 2026-08-27. Source: `maxgame-auth-server/src/infrastructure/adapters/key_server.rs` (`VerifiedServiceKey::granted_tenants`, `may_see_tenant`, `has_any_tenant`), `src/interface/routes/external.rs` (`visible_accounts`). |
 | `authServer` (`maxgame-auth-server`) | `GET /v1/external/players/{player_id}` | `accounts:player-read` | Same `metadata.tenants` gate, same fail-closed reading, and the same 403/404 split as the row above — this route calls the identical `visible_accounts` predicate, which is what guarantees it can never be more permissive about *who* is visible than the accounts-list route is. Additionally gated on `metadata.pii` (`VerifiedServiceKey::may_see_pii`), **default deny**: **only a literal JSON `true` releases the full payload — absent, `false`, `"true"`, `1`, and every other non-boolean shape all mean the trimmed one.** What `pii: true` unlocks is the player's email address and their Google account id (`links[].provider_account_id`). The trimmed payload (`ExternalPlayerView`) is a **distinct struct that structurally cannot carry either field**, not `MeResult` re-used with a `skip_serializing_if` attribute — an attribute is one careless edit away from leaking the field it hides, whereas a type with no `email` field cannot serialize one no matter what is later done to it. `mxs_`-only. Added 2026-08-27. Source: `maxgame-auth-server/src/infrastructure/adapters/key_server.rs` (`VerifiedServiceKey::may_see_pii`), `src/interface/routes/external.rs` (`ExternalPlayerView`, `ExternalPlayerResponse`). |
 | `launcher` (`maxgame-launcher-backend`) | `GET /v1/external/games?channel=` | `launcher:games-read` | **Possession-only**, the same shape as `accounts:games-read` above: the catalog is the same for every holder, so the verified key's `metadata` is not read. The body is `games_catalog(...)` verbatim — the same function `GET /v1/internal/games` calls — so the two routes cannot answer differently about the data; they differ only in who may ask. `mxs_`-only. Added 2026-08-27. **This is the first scope `maxgame-launcher-backend` enforces, and it makes the service tier-3-facing for the first time.** Before this it was tier-2 only, in both directions §6.0 already describes: a *caller* (its own auth-server join over `/v1/internal/games`) and, since the 2026-08-24 plan, a *callee* (`GET /v1/internal/games` served to fleet-mates with no credential at all). That tier-2 route is untouched by this row — the tier-3 route is a gated twin sitting in front of the same handler body, not a replacement for it. Source: `maxgame-launcher-backend/src/adapters/key_server.rs`, `src/modules/external/mod.rs`. |
+| `knowledge` (`maxgame-knowledge-server`) | `GET /v1/external/collections` · `POST /v1/external/ask` · `POST`/`GET /v1/external/documents` · `GET`/`DELETE /v1/external/documents/{id}` (all under `/knowledge`) | `knowledge:query` (ask) · `knowledge:ingest` (documents) · either one (collections) | `metadata.collections` (array of collection slugs), **explicit only**, the same fail-closed shape as `mailer`'s `allowed_senders` and `authServer`'s `tenants`: **absent `metadata`, absent `collections`, an empty array, or a non-array all grant no collection, never every collection.** Matching is exact and case-sensitive. A collection or document outside the key's collections answers **404**, byte-identical to one that does not exist (§6.0's 404-collapse rule); listing documents without naming a collection is 422. No key, an inactive key or a missing scope is 401; key-server down, timing out or answering 429 is 503. Accepted verdicts are cached for 60 s (refusals never), so a revoke takes effect within that TTL. `x-verifier-service: knowledge`. `mxs_`-only. Query keys for admins come from key-server's delegated door (§6.3); the importer's ingest key comes from `/v1/admin/keys`. Added 2026-11-08 (service being built). Source: `maxgame-knowledge-server`, plan `platform-workspace/.omc/plans/maxgame-knowledge-server.md` §3. |
 
 Error taxonomy, same as §6.2 with one addition worth naming explicitly: a
 verdict of `active: false` (any of the four `reason` values in §6.1) is a
