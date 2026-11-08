@@ -1335,14 +1335,21 @@ same order as the super_admin gate:
 
 | Method · path (under `/keys`) | Behaviour |
 |---|---|
-| `POST /v1/admin/knowledge-keys` | Body `{collections, name?, expires_in_days?}`. `collections`: 1 to 10 slugs, each `^[a-z0-9-]{1,64}$`, duplicates collapsed. `expires_in_days`: 1 to 30, default 7. Anything outside that, or any other field (`scopes`, `consumer`, `metadata`), is 422. key-server fixes `scopes = ["knowledge:query"]`, `consumer = "knowledge-delegated:<admin id>"` (the IdP admin id, never an email) and `metadata = {"collections": [...]}`. 201 returns the plaintext once, same shape as `POST /v1/admin/keys`. At most 10 issues per admin per rolling hour, counted from `service_key` itself, so the window survives restarts and is shared by replicas. Over the limit is 429 with `Retry-After` (§3.6 rule 1). |
+| `POST /v1/admin/knowledge-keys` | Body `{collections, name?, expires_in_days?}`. `collections`: 1 to 10 slugs, each `^[a-z0-9-]{1,64}$`, duplicates collapsed. `expires_in_days`: 1 to 30, default 7. `name`: at most 64 characters after trimming, no control characters. Anything outside that, or any other field (`scopes`, `consumer`, `metadata`), is 422. key-server fixes `scopes = ["knowledge:query"]`, `consumer = "knowledge-delegated:<admin id>"` (the IdP admin id, never an email) and `metadata = {"collections": [...]}`. 201 returns the plaintext once, same shape as `POST /v1/admin/keys`. At most 10 issues per admin per rolling hour, counted from `service_key` itself, so the window survives restarts and is shared by replicas. Over the limit is 429 with `Retry-After` (§3.6 rule 1). |
 | `GET /v1/admin/knowledge-keys?page=&take=` | Only keys whose `consumer` is the caller's own `knowledge-delegated:<admin id>`. No `consumer` filter is accepted (400). Same `{items, meta}` envelope as §2.1. |
 | `POST /v1/admin/knowledge-keys/{id}/revoke` | Only the caller's own keys. Any other id is 404, byte-identical to an unknown id. A second revoke is 409. |
 
 Both the `issue` and `revoke` rows in `key_audit` carry `detail.delegated =
 true`, with `actor` = the admin id. A leaked admin token with the feature can
 therefore mint only short-lived query keys over collections it names, in its
-own name. Everything else, including the importer's `knowledge:ingest` key,
+own name, and never more than 50 active (unrevoked, unexpired) at once: the
+51st is 429 `ACTIVE_KEY_LIMIT`, and the response to a compromised admin is to
+revoke every key whose `consumer` is `knowledge-delegated:<admin id>`.
+Collections listed in key-server's `KNOWLEDGE_RESTRICTED_COLLECTIONS`
+(comma-separated slugs, default `mu-maxage-alpha-cs`, set empty to restrict
+nothing) are refused with 422 `COLLECTION_RESTRICTED` unless the caller's
+token role is `super_admin` — which an external-tier client never carries,
+so through such a client those keys come only from `/v1/admin/keys`. Everything else, including the importer's `knowledge:ingest` key,
 stays on `/v1/admin/keys`. Source: `maxgame-key-server/src/routes/knowledge_keys.rs`,
 `src/services/admin_keys.rs` (`issue_delegated`, `revoke_as`),
 `src/infrastructure/admin_auth.rs` (`require_knowledge_issuer`); tests in
