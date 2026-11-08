@@ -1341,16 +1341,28 @@ same order as the super_admin gate:
 
 Both the `issue` and `revoke` rows in `key_audit` carry `detail.delegated =
 true`, with `actor` = the admin id. A leaked admin token with the feature can
-therefore mint only short-lived query keys over collections it names, in its
-own name, and never more than 50 active (unrevoked, unexpired) at once: the
-51st is 429 `ACTIVE_KEY_LIMIT`, and the response to a compromised admin is to
-revoke every key whose `consumer` is `knowledge-delegated:<admin id>`.
-Collections listed in key-server's `KNOWLEDGE_RESTRICTED_COLLECTIONS`
-(comma-separated slugs, default `mu-maxage-alpha-cs`, set empty to restrict
-nothing) are refused with 422 `COLLECTION_RESTRICTED` unless the caller's
-token role is `super_admin` — which an external-tier client never carries,
-so through such a client those keys come only from `/v1/admin/keys`. Everything else, including the importer's `knowledge:ingest` key,
-stays on `/v1/admin/keys`. Source: `maxgame-key-server/src/routes/knowledge_keys.rs`,
+therefore mint only short-lived query keys over allowlisted collections, in
+its own name, and never more than 50 active (unrevoked, unexpired) at once:
+the 51st is 429 `ACTIVE_KEY_LIMIT`, and the response to a compromised admin is
+to revoke every key whose `consumer` is `knowledge-delegated:<admin id>`.
+The allowlist is fail-closed: a collection can be named only if it is in
+key-server's `KNOWLEDGE_DELEGABLE_COLLECTIONS` (comma-separated slugs; unset
+or empty means nothing is delegable). Anything else is 422
+`COLLECTION_NOT_DELEGABLE` for every caller, `super_admin` included, so a
+collection created later is not delegable until someone lists it. Dev sets
+`mu-maxage,zone4,mu-maxage-alpha-cs` in its gitops manifest. Of those, the
+ones in `KNOWLEDGE_RESTRICTED_COLLECTIONS` (default `mu-maxage-alpha-cs`, set
+empty to restrict nothing) are refused with 422 `COLLECTION_RESTRICTED`
+unless the caller's token role is `super_admin` — which an external-tier
+client never carries, so through such a client those keys come only from
+`/v1/admin/keys`. A non-slug entry in either list refuses to boot, and boot
+logs both lists, with a warning when the delegable one is empty.
+**Offboarding:** once `issue-key` is removed from an admin, that admin can no
+longer list or revoke the delegated keys they issued (all three routes are
+403). Their keys stay valid until they expire, so a `super_admin` must revoke
+them through `/sa/service-keys` (filter by consumer
+`knowledge-delegated:<admin id>`). Everything else, including the importer's
+`knowledge:ingest` key, stays on `/v1/admin/keys`. Source: `maxgame-key-server/src/routes/knowledge_keys.rs`,
 `src/services/admin_keys.rs` (`issue_delegated`, `revoke_as`),
 `src/infrastructure/admin_auth.rs` (`require_knowledge_issuer`); tests in
 `tests/knowledge_keys_test.rs`.
