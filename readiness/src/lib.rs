@@ -58,7 +58,8 @@
 //!     readiness.hop_failed("key_server");
 //! }
 //!
-//! // background runner: one cycle at once, then every interval, jittered
+//! // background runner: one cycle at once, then every interval, jittered;
+//! // a hop that is not ok is re-run after 10 s, backing off to the interval
 //! let runner = readiness.spawn();
 //!
 //! // mounted at the pod root, never under BASE_PATH

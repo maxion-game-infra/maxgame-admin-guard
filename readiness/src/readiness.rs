@@ -39,8 +39,15 @@ pub const MAX_TRIGGER_COOLDOWN_SECONDS: u64 = 60;
 /// Environment variable that overrides the trigger cooldown (`CONTRACT.md`
 /// §6.4).
 pub const TRIGGER_COOLDOWN_ENV_VAR: &str = "READYZ_TRIGGER_COOLDOWN_SECONDS";
+/// How soon a hop whose last result was not `ok` is re-run; the delay
+/// doubles on every further failure, capped at the interval (`CONTRACT.md`
+/// §6.1). A new pod's first probe can run before the cluster's
+/// NetworkPolicy admits it, and that one refusal would otherwise read
+/// `degraded` for a whole interval.
+pub const FAILURE_RETRY_SECONDS: u64 = 10;
 
 const DEFAULT_INTERVAL: Duration = Duration::from_secs(DEFAULT_INTERVAL_SECONDS);
+const FAILURE_RETRY: Duration = Duration::from_secs(FAILURE_RETRY_SECONDS);
 const DEFAULT_TRIGGER_COOLDOWN: Duration = Duration::from_secs(DEFAULT_TRIGGER_COOLDOWN_SECONDS);
 const MIN_TRIGGER_COOLDOWN: Duration = Duration::from_secs(MIN_TRIGGER_COOLDOWN_SECONDS);
 const MAX_TRIGGER_COOLDOWN: Duration = Duration::from_secs(MAX_TRIGGER_COOLDOWN_SECONDS);
@@ -91,6 +98,10 @@ struct ReportingState {
     /// triggered one, which is what the backoff keys off. Consumed by that
     /// run (`CONTRACT.md` §6.4).
     triggered: bool,
+    /// Delay before the next run if this one is not `ok`: the base
+    /// failure retry, doubled per consecutive failure, capped at the hop's
+    /// effective interval. Back to the base on an `ok` (`CONTRACT.md` §6.1).
+    retry_current: Duration,
 }
 
 struct Inner {
@@ -103,6 +114,9 @@ struct Inner {
     /// [`Readiness::hop_failed`] signal is first honoured, and what the
     /// cooldown returns to after a quiet interval or a confirmed failure.
     trigger_cooldown: Duration,
+    /// Base delay before re-running a hop that did not come back `ok`
+    /// (`CONTRACT.md` §6.1).
+    failure_retry: Duration,
     hops: Vec<Hop>,
     reporting: Mutex<Vec<ReportingState>>,
     /// Whether a check of this reporting hop is running right now, indexed
@@ -200,6 +214,7 @@ pub struct ReadinessBuilder {
     interval: Duration,
     probe_timeout: Duration,
     trigger_cooldown: Duration,
+    failure_retry: Duration,
     hops: Vec<HopSpec>,
     omit_targets: bool,
     on_demand: Option<Duration>,
@@ -223,6 +238,7 @@ impl Readiness {
             interval: DEFAULT_INTERVAL,
             probe_timeout: DEFAULT_PROBE_TIMEOUT,
             trigger_cooldown: DEFAULT_TRIGGER_COOLDOWN,
+            failure_retry: FAILURE_RETRY,
             hops: Vec::new(),
             omit_targets: false,
             on_demand: None,
@@ -849,7 +865,24 @@ async fn run_group(inner: &Arc<Inner>, members: Vec<usize>) {
                 checked_at: checked_at.clone(),
                 produced_at,
             });
-            state.next_due = produced_at + jittered(inner.effective_interval(hop));
+            let effective = inner.effective_interval(hop);
+            // A failure is re-run sooner, backing off to the interval. A hop
+            // with its own minimum interval guards a third party's quota
+            // (§6.3 rule 4), so it keeps its schedule.
+            let delay = if outcome.status == CheckStatus::Ok
+                || hop
+                    .probe
+                    .as_ref()
+                    .is_some_and(|p| p.min_interval().is_some())
+            {
+                state.retry_current = inner.failure_retry;
+                effective
+            } else {
+                let delay = state.retry_current.min(effective);
+                state.retry_current = state.retry_current.saturating_mul(2).min(effective);
+                delay
+            };
+            state.next_due = produced_at + jittered(delay);
             // The §6.4 backoff keys off a run a signal asked for. A probe
             // that stays ok while requests fail doubles the cooldown, capped
             // at the hop's effective interval; a probe that confirms the
@@ -1139,6 +1172,15 @@ impl ReadinessBuilder {
         self
     }
 
+    /// Override the base failure retry ([`FAILURE_RETRY_SECONDS`]). Exists
+    /// for tests that need to watch the retry back off; production code
+    /// keeps the default.
+    #[doc(hidden)]
+    pub fn failure_retry_unclamped(mut self, retry: Duration) -> Self {
+        self.failure_retry = retry;
+        self
+    }
+
     /// Read the cooldown from `READYZ_TRIGGER_COOLDOWN_SECONDS`
     /// (`CONTRACT.md` §6.4). A value that does not parse keeps the default; a
     /// value outside 1–60 s is clamped. Both cases warn.
@@ -1217,6 +1259,7 @@ impl ReadinessBuilder {
                         cooldown_current: self.trigger_cooldown,
                         last_signal_at: None,
                         triggered: false,
+                        retry_current: self.failure_retry,
                     });
                     Some(reporting.len() - 1)
                 }
@@ -1240,6 +1283,7 @@ impl ReadinessBuilder {
             interval: self.interval,
             probe_timeout: self.probe_timeout,
             trigger_cooldown: self.trigger_cooldown,
+            failure_retry: self.failure_retry,
             hops,
             reporting: Mutex::new(reporting),
             in_flight,
